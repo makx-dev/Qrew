@@ -1,0 +1,34 @@
+{
+  "name": "qrew",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx watch src/producer.ts",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/makx-dev/Qrew.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/makx-dev/Qrew/issues"
+  },
+  "homepage": "https://github.com/makx-dev/Qrew#readme",
+  "dependencies": {
+    "bullmq": "^6.3.17",
+    "dotenv": "^18.0.8",
+    "ioredis": "^6.0.0",
+    "redis": "^6.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}
