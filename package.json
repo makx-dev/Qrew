@@ -5,8 +5,10 @@
   "main": "index.js",
   "scripts": {
     "build": "tsc",
-    "dev": "tsx watch src/producer.ts",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "worker:dev": "tsx src/worker-runner.ts",
+    "producer:dev": "tsx src/producer-runner.ts",
+    "worker:start": "node dist/worker.js",
+    "producer:start": "node dist/produce.js"
   },
   "repository": {
     "type": "git",

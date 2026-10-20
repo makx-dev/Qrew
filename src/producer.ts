@@ -11,6 +11,7 @@ export async function addPaintJob(payload: PaintJob) {
         backoff: { type: 'exponential', delay: 500 },
         removeOnComplete: 1000, //keeps the last 1000 jobs completed
         removeOnFail: false, //keeps the last 1000 jobs failed
+        delay: 1000,
     });
 }
 

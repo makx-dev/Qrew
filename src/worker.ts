@@ -11,6 +11,9 @@ export const worker = new Worker(
                 const data = job.data as { color: string };
                 // idempotent handler, can be retried
                 console.log(`Painting color=${data.color}, jobId=${job.id}`);
+
+                // Simulate real async work (e.g. 2 seconds per job)
+                await new Promise((resolve) => setTimeout(resolve, 2000));
                 // perform async work...
                 return { ok: true };
             }
@@ -20,6 +23,7 @@ export const worker = new Worker(
     },
     { connection: redisConnection, concurrency: 5 }
 );
+
 
 worker.on('completed', (job: Job) => {
     console.log(`Job ${job.id} completed`);
