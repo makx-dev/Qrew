@@ -1,6 +1,5 @@
 import { addNotificationJob, addEmailJob, addImageJob, closeProducer } from './producer';
 import { redisConnection } from './redis-connection';
-import { JobPriority, ImageProcessingPayload, EmailPayload, NotificationPayload } from './JobTypes';
 
 // Sample verification flow in producer-runner.ts
 async function main() {

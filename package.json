@@ -5,10 +5,11 @@
   "main": "index.js",
   "scripts": {
     "build": "tsc",
-    "worker:dev": "tsx src/worker-runner.ts",
-    "producer:dev": "tsx src/producer-runner.ts",
+    "worker:dev": "tsx worker-runner.ts",
+    "producer:dev": "tsx producer-runner.ts",
     "worker:start": "node dist/worker.js",
-    "producer:start": "node dist/produce.js"
+    "producer:start": "node dist/produce.js",
+    "test:priority": "tsx src/priority-load-test.ts"
   },
   "repository": {
     "type": "git",
