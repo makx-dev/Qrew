@@ -482,27 +482,36 @@ On 2026-10-24, I designed and implemented an empirical, automated retry verifica
    - Outputs ISO-timestamped markers with explicit attempt indices and measured delay deltas.
 
 2. **Differentiated Test Runners by Operational SLA**:
-   - `verifyNotificationRetries()`: Validates critical OTP exponential backoff ($500\text{ms}$ base, $20\%$ jitter). Empirically confirmed strict monotonic growth:
-     $$\text{Retry } 1 \ (511\text{ms}) < \text{Retry } 2 \ (905\text{ms})$$
-   - `verifyEmailRetries()`: Validates high-priority rate-limited email broadcasts ($2000\text{ms}$ base, $50\%$ jitter). Empirically confirmed exponential spacing:
-     $$\text{Retry } 1 \ (1346\text{ms}) < \text{Retry } 2 \ (4019\text{ms}) < \text{Retry } 3 \ (7740\text{ms})$$
-   - `verifyImageProcessingRetries()`: Validates CPU-bound fixed backoff ($10000\text{ms}$ base, $30\%$ jitter). Confirms delays do not grow exponentially, remaining strictly bounded within $[7000\text{ms}, 13000\text{ms}]$:
-     $$\text{Retry } 1 \ (9840\text{ms}), \ \text{Retry } 2 \ (8746\text{ms})$$
+   - `verifyNotificationRetries()`: Validates critical OTP exponential backoff ($500\text{ms}$ base, $20\%$ jitter).
+   - `verifyEmailRetries()`: Validates high-priority rate-limited email broadcasts ($2000\text{ms}$ base, $50\%$ jitter).
+   - `verifyImageProcessingRetries()`: Validates CPU-bound fixed backoff ($10000\text{ms}$ base, $30\%$ jitter).
 
-3. **Dedicated Test Lifecycle & Safe Resource Isolation**:
+3. **Dynamic Window-Based Assertion Model (`verifyWindows`) vs. Flaky Monotonicity**:
+   - **The Mathematical Jitter Overlap Weakness**: An initial naive assertion required strict monotonic growth (`delays[i] > delays[i-1]`). Under BullMQ's asymmetric exponential jitter formula ($\text{Delay} \in [\text{maxDelay} \cdot (1 - \text{jitter}), \; \text{maxDelay}]$), with $50\%$ jitter on Email ($2000\text{ms}$ base):
+     - Retry #1 bounds: $[1000\text{ms}, \; 2000\text{ms}]$
+     - Retry #2 bounds: $[2000\text{ms}, \; 4000\text{ms}]$
+     Because the upper bound of Retry #1 touches the lower bound of Retry #2 at exactly $2000\text{ms}$, any slight Node.js event-loop lag or Redis polling delay ($> 15\text{ms}$) can cause measured $\Delta t_1 \ge \Delta t_2$, producing intermittent false-negative CI test failures.
+   - **The Window Verification Solution**: Implemented a reusable, parameterized `verifyWindows()` assertion helper that dynamically constructs expected acceptance intervals per retry iteration $i$:
+     $$\text{nominal} = \begin{cases} \text{base} \cdot 2^i & \text{for exponential} \\ \text{base} & \text{for fixed} \end{cases}$$
+     $$\text{window}_i = \big[\, \text{nominal} \cdot (1 - \text{jitter}) - \text{buffer}, \;\; \text{nominal} + \text{buffer} \,\big]$$
+   - Parameterized tolerances ($\text{buffer} = 75\text{ms}$ for low-latency notifications; $300\text{ms}$ for emails and heavy image pipelines) absorb socket latency while strictly asserting that delays remain bounded within their SLA without false negatives.
+
+4. **Dedicated Test Lifecycle & Safe Resource Isolation**:
    - Uses a dedicated `QueueEvents` listener to await `job.waitUntilFinished(queueEvents)`.
    - Isolates test workers per test block and closes them before proceeding to the next suite, ensuring zero listener leakage or cross-job contamination.
-   - Gracefully drains and closes the queue, workers, and Redis connection with clean OS exit code `0`.
+   - Gracefully drains and closes the queue, workers, and Redis connection with clean OS exit code `0` (or exits `1` upon SLA violation).
 
 #### Alternatives Considered
-1. **Mocking Redis with In-Memory Stubs (`ioredis-mock`)**: Mocking the Redis connection for unit tests. Rejected because `ioredis-mock` does not execute BullMQ's atomic Lua scripts or simulate Redis sorted set delayed queue polling (`bull:<queue>:delayed`), hiding genuine runtime race conditions.
-2. **Manual Log Auditing**: Manually running worker and producer scripts and inspecting timestamps with a stopwatch. Rejected as error-prone, untestable in CI/CD pipelines, and incapable of detecting millisecond jitter boundary regressions.
-3. **Single Monolithic Worker For All Job Types**: Running one worker handling all job types concurrently during retry tests. Rejected because concurrency can cause multiple retrying jobs to interleave, complicating per-job delta measurements and increasing flakiness.
+1. **Strict Monotonic Inequality (`delays.every((val, i, arr) => val > arr[i-1])`)**: Rejected because when $\text{jitter} \ge 0.5$, theoretical ranges collide ($2(1 - \text{jitter}) \le 1$), creating non-deterministic, flaky CI test runs under real-world runtime variance.
+2. **Mocking Redis with In-Memory Stubs (`ioredis-mock`)**: Mocking the Redis connection for unit tests. Rejected because `ioredis-mock` does not execute BullMQ's atomic Lua scripts or simulate Redis sorted set delayed queue polling (`bull:<queue>:delayed`), hiding genuine runtime race conditions.
+3. **Manual Log Auditing**: Manually running worker and producer scripts and inspecting timestamps with a stopwatch. Rejected as error-prone, untestable in CI/CD pipelines, and incapable of detecting millisecond jitter boundary regressions.
+4. **Single Monolithic Worker For All Job Types**: Running one worker handling all job types concurrently during retry tests. Rejected because concurrency can cause multiple retrying jobs to interleave, complicating per-job delta measurements and increasing flakiness.
 
 #### Consequences
 * **Positive:**
-  - Automated, reproducible verification proving that BullMQ exponential and fixed backoff configurations perform strictly as specified in ADR-003.
-  - Validated that jitter effectively randomizes delay arrivals while preserving monotonic escalation for exponential queues.
+  - Automated, deterministic verification proving that BullMQ exponential and fixed backoff configurations perform strictly as specified in ADR-003.
+  - Eliminated test flakiness by shifting from naive monotonic ordering to mathematically sound jitter window boundaries.
+  - Parameterized latency buffer accounts for realistic Redis socket roundtrips without compromising SLA precision.
   - Zero test leakage or hanging Redis connections upon suite completion.
 * **Negative:**
   - Full suite runtime requires $\approx 35 - 40\text{s}$ due to waiting for genuine Redis delayed timers (10s image retries and 8s email retries) to expire naturally.

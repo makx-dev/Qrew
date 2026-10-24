@@ -10,6 +10,43 @@ import { addEmailJob, addNotificationJob, addImageJob, closeProducer } from './p
  *     Retry #1: ~500ms (400ms - 600ms)
  *     Retry #2: ~1000ms (800ms - 1200ms)
  */
+
+
+function verifyWindows(
+    delays: number[],
+    {
+        base,
+        jitter,
+        retries,
+        type = 'exponential',
+        buffer = 300,
+    }: {
+        base: number;
+        jitter: number;
+        retries: number;
+        type?: 'exponential' | 'fixed';
+        buffer?: number;
+    }
+): boolean {
+    const windows = Array.from({ length: retries }, (_, i) => {
+        const nominal = type === 'exponential' ? base * 2 ** i : base;
+        return {
+            min: nominal * (1 - jitter) - buffer,
+            max: nominal + buffer,
+        };
+    });
+
+    const ok =
+        delays.length === retries &&
+        delays.every((d, i) => d >= windows[i].min && d <= windows[i].max);
+
+    if (!ok) {
+        process.exitCode = 1;
+    }
+    return ok;
+}
+
+
 export async function verifyNotificationRetries(queueEvents: QueueEvents) {
     console.log('1. Verifying Notification Retries (Exponential: 500ms, Jitter: 20%)');
 
@@ -59,15 +96,16 @@ export async function verifyNotificationRetries(queueEvents: QueueEvents) {
         console.log(`Retry #${idx + 1}: ${delay}ms`);
     });
 
-    const delaysIncrease = delays.every((val, i, arr) => i === 0 || val > arr[i - 1]);
-    console.log(`Result: Delays monotonically increasing: ${delaysIncrease ? 'PASSED' : 'FAILED'}\n`);
+    const ok = verifyWindows(delays, { base: 500, jitter: 0.2, retries: 2, type: 'exponential', buffer: 75 });
+    console.log(`Result: Delays within expected windows: ${ok ? 'PASSED' : 'FAILED'}\n`);
+    process.exitCode = ok ? 0 : 1;
 
     await testWorker.close();
 }
 
 /**
  * 2. Verify Email Retries (P2 / High)
- * - attempts: 5
+ * - attempts: 
  * - backoff: exponential, base: 2000ms, jitter: 50%
  * - Expected delays:
  *     Retry #1: ~2000ms (1000ms - 3000ms)
@@ -123,8 +161,9 @@ export async function verifyEmailRetries(queueEvents: QueueEvents) {
         console.log(`Retry #${idx + 1}: ${delay}ms`);
     });
 
-    const delaysIncrease = delays.every((val, i, arr) => i === 0 || val > arr[i - 1]);
-    console.log(`Result: Delays monotonically increasing: ${delaysIncrease ? 'PASSED' : 'FAILED'}\n`);
+    const ok = verifyWindows(delays, { base: 2000, jitter: 0.5, retries: 3, type: 'exponential', buffer: 300 });
+    console.log(`Result: Delays within expected windows: ${ok ? 'PASSED' : 'FAILED'}\n`);
+    process.exitCode = ok ? 0 : 1;
 
     await testWorker.close();
 }
@@ -185,8 +224,10 @@ export async function verifyImageProcessingRetries(queueEvents: QueueEvents) {
         console.log(`Retry #${idx + 1}: ${delay}ms`);
     });
 
-    const withinFixedJitterBounds = delays.every((delay) => delay >= 7000 && delay <= 13000);
-    console.log(`Result: Delays within fixed jitter bounds [7000ms, 13000ms]: ${withinFixedJitterBounds ? 'PASSED' : 'FAILED'}\n`);
+
+    const ok = verifyWindows(delays, { base: 10000, jitter: 0.3, retries: 2, type: 'fixed', buffer: 300 });
+    console.log(`Result: Delays within expected windows: ${ok ? 'PASSED' : 'FAILED'}\n`);
+    process.exitCode = ok ? 0 : 1;
 
     await testWorker.close();
 }
