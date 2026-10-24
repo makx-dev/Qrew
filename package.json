@@ -9,7 +9,8 @@
     "producer:dev": "tsx producer-runner.ts",
     "worker:start": "node dist/worker.js",
     "producer:start": "node dist/produce.js",
-    "test:priority": "tsx src/priority-load-test.ts"
+    "test:priority": "tsx src/priority-load-test.ts",
+    "test:retry": "tsx src/verify-retries.ts"
   },
   "repository": {
     "type": "git",

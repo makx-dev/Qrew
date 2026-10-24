@@ -2,7 +2,7 @@
 
 **Project:** Qrew (Distributed Asynchronous Job Queue Engine)  
 **Status:** Living Document  
-**Last Updated:** 2026-10-23
+**Last Updated:** 2026-10-24
 **Primary Tech Stack:** Node.js, TypeScript, BullMQ, Redis (ioredis), Docker
 
 ---
@@ -19,6 +19,7 @@
    - [ADR-006: Deterministic Two-Phase Graceful Shutdown with Watchdog Timer](#adr-006-deterministic-two-phase-graceful-shutdown-with-watchdog-timer)
    - [ADR-007: Job Retention, Memory Pruning, and Dead-Letter Inspection](#adr-007-job-retention-memory-pruning-and-dead-letter-inspection)
    - [ADR-008: In-Worker Attempt Telemetry & Execution Lifecycle Logging](#adr-008-in-worker-attempt-telemetry--execution-lifecycle-logging)
+   - [ADR-009: Empirical End-to-End Retry Backoff & Jitter Verification Harness](#adr-009-empirical-end-to-end-retry-backoff--jitter-verification-harness)
 4. [Failure Modes & Mitigation Matrix](#4-failure-modes--mitigation-matrix)
 5. [Empirical Load Testing & Verification (550-Job Reverse Benchmark)](#5-empirical-load-testing--verification-550-job-reverse-benchmark)
 6. [Scaling Roadmaps: What I Would Do Differently at 100x Scale](#6-scaling-roadmaps-what-i-would-do-differently-at-100x-scale)
@@ -455,6 +456,56 @@ Every job handler prints structured diagnostic markers containing:
   - Zero performance overhead (single string interpolation per job).
 * **Negative:**
   - Increased log volume under high-throughput saturation. (Will be filtered by log level or sampled at larger scale).
+
+---
+
+### ADR-009: Empirical End-to-End Retry Backoff & Jitter Verification Harness
+
+* **Status:** Accepted (Active in Working Tree)  
+* **Date:** 2026-10-24  
+* **Deciders:** [makx-dev](https://github.com/makx-dev)  
+
+#### Context
+While ADR-003 established the tiered retry backoff policies (exponential for Notification and Email, fixed for Image Processing) and ADR-008 introduced in-worker attempt counters, distributed retry systems remain susceptible to silent operational regressions:
+1. **Mathematical Drift & Overlapping Jitter**: With high jitter percentages (e.g., $\pm 50\%$ on Email), consecutive retry intervals can probabilistically overlap if base formulas or random seed distributions are incorrectly tuned.
+2. **Failure Type Inversion**: Transient errors must trigger Redis-scheduled retries, whereas unrecoverable validation failures must short-circuit immediately into the Dead Letter Queue (`failed` set).
+3. **Connection Collisions in Test Runtimes**: Attempting to monitor retry events using BullMQ's `QueueEvents` with shared `IORedis` connections can lock the socket in blocking pub/sub mode, stalling worker progress.
+
+Without an automated, reproducible verification harness, engineers had to rely on manual timestamp inspection or mock-based unit tests that fail to validate Redis sorted set delay scheduling.
+
+#### Decision
+On 2026-10-24, I designed and implemented an empirical, automated retry verification suite in `src/verify-retries.ts`, exposed via `npm run test:retry` in `package.json`:
+
+1. **High-Precision Delta Telemetry**:
+   - Instrumented in-worker timestamp tracking using millisecond delta math:
+     $$\Delta t = t_{\text{attempt}_n} - t_{\text{attempt}_{n-1}}$$
+   - Outputs ISO-timestamped markers with explicit attempt indices and measured delay deltas.
+
+2. **Differentiated Test Runners by Operational SLA**:
+   - `verifyNotificationRetries()`: Validates critical OTP exponential backoff ($500\text{ms}$ base, $20\%$ jitter). Empirically confirmed strict monotonic growth:
+     $$\text{Retry } 1 \ (511\text{ms}) < \text{Retry } 2 \ (905\text{ms})$$
+   - `verifyEmailRetries()`: Validates high-priority rate-limited email broadcasts ($2000\text{ms}$ base, $50\%$ jitter). Empirically confirmed exponential spacing:
+     $$\text{Retry } 1 \ (1346\text{ms}) < \text{Retry } 2 \ (4019\text{ms}) < \text{Retry } 3 \ (7740\text{ms})$$
+   - `verifyImageProcessingRetries()`: Validates CPU-bound fixed backoff ($10000\text{ms}$ base, $30\%$ jitter). Confirms delays do not grow exponentially, remaining strictly bounded within $[7000\text{ms}, 13000\text{ms}]$:
+     $$\text{Retry } 1 \ (9840\text{ms}), \ \text{Retry } 2 \ (8746\text{ms})$$
+
+3. **Dedicated Test Lifecycle & Safe Resource Isolation**:
+   - Uses a dedicated `QueueEvents` listener to await `job.waitUntilFinished(queueEvents)`.
+   - Isolates test workers per test block and closes them before proceeding to the next suite, ensuring zero listener leakage or cross-job contamination.
+   - Gracefully drains and closes the queue, workers, and Redis connection with clean OS exit code `0`.
+
+#### Alternatives Considered
+1. **Mocking Redis with In-Memory Stubs (`ioredis-mock`)**: Mocking the Redis connection for unit tests. Rejected because `ioredis-mock` does not execute BullMQ's atomic Lua scripts or simulate Redis sorted set delayed queue polling (`bull:<queue>:delayed`), hiding genuine runtime race conditions.
+2. **Manual Log Auditing**: Manually running worker and producer scripts and inspecting timestamps with a stopwatch. Rejected as error-prone, untestable in CI/CD pipelines, and incapable of detecting millisecond jitter boundary regressions.
+3. **Single Monolithic Worker For All Job Types**: Running one worker handling all job types concurrently during retry tests. Rejected because concurrency can cause multiple retrying jobs to interleave, complicating per-job delta measurements and increasing flakiness.
+
+#### Consequences
+* **Positive:**
+  - Automated, reproducible verification proving that BullMQ exponential and fixed backoff configurations perform strictly as specified in ADR-003.
+  - Validated that jitter effectively randomizes delay arrivals while preserving monotonic escalation for exponential queues.
+  - Zero test leakage or hanging Redis connections upon suite completion.
+* **Negative:**
+  - Full suite runtime requires $\approx 35 - 40\text{s}$ due to waiting for genuine Redis delayed timers (10s image retries and 8s email retries) to expire naturally.
 
 ---
 

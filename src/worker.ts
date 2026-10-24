@@ -1,7 +1,6 @@
-import { Worker, Job } from 'bullmq';
+import { Worker, Job, UnrecoverableError } from 'bullmq';
 import { redisConnection } from './redis-connection';
 import { NotificationPayload, EmailPayload, ImageProcessingPayload } from './JobTypes';
-import { UnrecoverableError } from 'bullmq';
 
 function isValidEmail(email: string): boolean {
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -13,13 +12,35 @@ function isValidImage(url: string): boolean {
     return typeof url === 'string' && urlRegex.test(url.trim());
 }
 
+// Map to track the timestamp of the previous attempt per job ID
+const attemptTimestamps = new Map<string, number>();
+
 export const worker = new Worker(
     'my-queue',
     async (job: Job) => {
+        const now = Date.now();
+        const isoTime = new Date(now).toISOString();
+        const attempt = job.attemptsMade + 1;
+        const totalAttempts = job.opts.attempts ?? 1;
         const priority = job.opts.priority ?? 'default';
+        // Calculate delta since last attempt (if retried)
+        const lastAttempt = attemptTimestamps.get(job.id!);
+        const deltaMs = lastAttempt ? now - lastAttempt : 0;
+        attemptTimestamps.set(job.id!, now);
+        console.log(
+            `[${isoTime}] [ATTEMPT ${attempt}/${totalAttempts}] Job ${job.name} (ID: ${job.id}, Priority: ${priority})` +
+            (lastAttempt ? ` -> Delay since last attempt: ${deltaMs}ms` : ' -> Initial execution')
+        );
         console.log(`[START] Processing ${job.name} (Priority: ${priority}, ID: ${job.id})`);
         switch (job.name) {
             case 'notification': {
+
+                // Simulate transient failure (e.g., HTTP 429 rate limit) on attempts 1 to 3
+                if (job.data.simulateTransientFailure && attempt < 4) {
+                    console.log(`[${isoTime}] [FAILING TRANSIENTLY] Simulating HTTP 429 for job ${job.id}`);
+                    throw new Error(`Simulated transient rate limit error (HTTP 429) on attempt ${attempt}`);
+                }
+
                 const data = job.data as NotificationPayload;
                 // Fast execution: simulating 200ms
                 await new Promise((r) => setTimeout(r, 200));
@@ -35,6 +56,12 @@ export const worker = new Worker(
                     throw new UnrecoverableError(`Invalid email address ${job.data.to}`);
                 }
 
+                // Simulate transient failure (e.g., HTTP 429 rate limit) on attempts 1 to 3
+                if (job.data.simulateTransientFailure && attempt < 4) {
+                    console.log(`[${isoTime}] [FAILING TRANSIENTLY] Simulating HTTP 429 for job ${job.id}`);
+                    throw new Error(`Simulated transient rate limit error (HTTP 429) on attempt ${attempt}`);
+                }
+
                 const data = job.data as EmailPayload;
                 // Moderate execution: simulating 500ms
                 await new Promise((r) => setTimeout(r, 500));
@@ -47,6 +74,12 @@ export const worker = new Worker(
             case 'image-processing': {
                 if (!isValidImage(job.data.imageUrl)) {
                     throw new UnrecoverableError(`Invalid image URL ${job.data.imageUrl}`);
+                }
+
+                // Simulate transient failure (e.g., HTTP 429 rate limit) on attempts 1 to 3
+                if (job.data.simulateTransientFailure && attempt < 4) {
+                    console.log(`[${isoTime}] [FAILING TRANSIENTLY] Simulating HTTP 429 for job ${job.id}`);
+                    throw new Error(`Simulated transient rate limit error (HTTP 429) on attempt ${attempt}`);
                 }
 
                 const data = job.data as ImageProcessingPayload;
