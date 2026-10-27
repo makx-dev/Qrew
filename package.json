@@ -10,7 +10,8 @@
     "worker:start": "node dist/worker.js",
     "producer:start": "node dist/produce.js",
     "test:priority": "tsx src/priority-load-test.ts",
-    "test:retry": "tsx src/verify-retries.ts"
+    "test:retry": "tsx src/verify-retries.ts",
+    "test:progress": "tsx src/verify-progress.ts"
   },
   "repository": {
     "type": "git",
