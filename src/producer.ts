@@ -7,7 +7,7 @@ import {
     ImageProcessingPayload,
 } from './JobTypes';
 
-const queue = new Queue('my-queue', { connection: redisConnection });
+export const queue = new Queue('my-queue', { connection: redisConnection });
 
 // 1. Critical notification: tight 20% jitter
 export async function addNotificationJob(
@@ -23,7 +23,7 @@ export async function addNotificationJob(
             jitter: 0.2, // 20% variance (400ms - 500ms for attempt 1)
         },
         removeOnComplete: 1000,
-        removeOnFail: false,
+        removeOnFail: { count: 1000 }, // Cap native failed jobs to avoid unbounded Redis growth
     });
 }
 
@@ -41,10 +41,11 @@ export async function addEmailJob(
             jitter: 0.5, // 50% variance (1.5s - 3s for attempt 1)
         },
         removeOnComplete: 1000,
-        removeOnFail: false,
+        removeOnFail: { count: 1000 }, // Cap native failed jobs
     });
 }
-// 3. Medium priority image processing: fixed 5s delay with 30% jitter
+
+// 3. Medium priority image processing: fixed 10s delay with 30% jitter
 export async function addImageJob(
     data: ImageProcessingPayload,
     priority: JobPriority = JobPriority.MEDIUM
@@ -58,7 +59,7 @@ export async function addImageJob(
             jitter: 0.3, // 30% variance (3.5s - 5.0s)
         },
         removeOnComplete: 1000,
-        removeOnFail: false,
+        removeOnFail: { count: 1000 }, // Cap native failed jobs
     });
 }
 

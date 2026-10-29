@@ -1,7 +1,8 @@
-import { Worker, Job, UnrecoverableError } from 'bullmq';
+import { Worker, Job } from 'bullmq';
 import { redisConnection } from './redis-connection';
 import { NotificationPayload, EmailPayload, ImageProcessingPayload } from './JobTypes';
 import { ThrottledProgress } from './throttled-progress';
+import { PoisonPillError, isPoisonPill } from './errors';
 
 function isValidEmail(email: string): boolean {
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -30,7 +31,8 @@ export const worker = new Worker(
 
             case 'email': {
                 if (!isValidEmail(job.data.to)) {
-                    throw new UnrecoverableError(`Invalid email address ${job.data.to}`);
+                    // Fatal validation error -> Poison Pill
+                    throw new PoisonPillError(`Invalid email address: ${job.data.to}`, 'INVALID_EMAIL');
                 }
 
                 const data = job.data as EmailPayload;
@@ -42,7 +44,8 @@ export const worker = new Worker(
 
             case 'image-processing': {
                 if (!isValidImage(job.data.imageUrl)) {
-                    throw new UnrecoverableError(`Invalid image URL ${job.data.imageUrl}`);
+                    // Fatal validation error -> Poison Pill
+                    throw new PoisonPillError(`Invalid image URL: ${job.data.imageUrl}`, 'INVALID_IMAGE_URL');
                 }
 
                 const data = job.data as ImageProcessingPayload;
@@ -75,21 +78,34 @@ export const worker = new Worker(
     },
     {
         connection: redisConnection,
-        concurrency: 1,
+        concurrency: 1, // Keep concurrency limit to 1
     }
 );
 
 worker.on('completed', (job: Job) => {
-    console.log(`Job ${job.id} completed`);
+    console.log(`[COMPLETED] Job ${job.id} completed successfully`);
 });
 
 worker.on('failed', (job: Job | undefined, err: Error) => {
-    console.error(`Job ${job?.id} failed:`, err);
+    if (!job) {
+        console.error('Job failed with unknown context:', err);
+        return;
+    }
+
+    if (isPoisonPill(job, err)) {
+        console.error(`[POISON PILL] Job ${job.id} (${job.name}) permanently failed: ${err.message}. Retries immediately skipped.`);
+    } else {
+        const attemptsLeft = (job.opts.attempts || 1) - job.attemptsMade;
+        if (attemptsLeft > 0) {
+            console.warn(`[TRANSIENT RETRY] Job ${job.id} (${job.name}) failed: ${err.message}. Backoff scheduled (${attemptsLeft} retries remaining)...`);
+        } else {
+            console.error(`[TRANSIENT EXHAUSTED] Job ${job.id} (${job.name}) exhausted all ${job.opts.attempts} attempts: ${err.message}. Preserved in native failed state.`);
+        }
+    }
 });
 
 // Graceful shutdown
 export async function shutdownWorker() {
     console.log('Shutting down worker...');
-    await worker.close(); // closes worker's own connections
-    // Note: do NOT quit redisConnection here if other parts of app still use it
+    await worker.close();
 }
