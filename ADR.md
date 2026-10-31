@@ -2,606 +2,305 @@
 
 **Project:** Qrew (Distributed Asynchronous Job Queue Engine)  
 **Status:** Living Document  
-**Last Updated:** 2026-10-24
-**Primary Tech Stack:** Node.js, TypeScript, BullMQ, Redis (ioredis), Docker
+**Last Updated:** 2026-10-31  
+**Primary Tech Stack:** Node.js, TypeScript, BullMQ, Redis (`ioredis`), Express, Docker  
 
 ---
 
 ## Table of Contents
 1. [System Architecture & End-to-End Data Flow](#1-system-architecture--end-to-end-data-flow)
-2. [Storage & Broker Evaluation: Why Redis + BullMQ Over Alternatives](#2-storage--broker-evaluation-why-redis--bullmq-over-alternatives)
+2. [Storage & Broker Evaluation: Redis + BullMQ](#2-storage--broker-evaluation-redis--bullmq)
 3. [Architectural Decision Records (ADRs)](#3-architectural-decision-records-adrs)
-   - [ADR-001: Message Broker & Queue Abstraction Engine](#adr-001-message-broker--queue-abstraction-engine)
-   - [ADR-002: Strict Priority Scheduling via Redis Sorted Sets (`ZSET`)](#adr-002-strict-priority-scheduling-via-redis-sorted-sets-zset)
+   - [ADR-001: Broker & Queue Abstraction Engine](#adr-001-broker--queue-abstraction-engine)
+   - [ADR-002: Strict Priority Scheduling via Sorted Sets (`ZSET`)](#adr-002-strict-priority-scheduling-via-sorted-sets-zset)
    - [ADR-003: Tiered Retry Backoff with Jitter Tailored by Job SLA](#adr-003-tiered-retry-backoff-with-jitter-tailored-by-job-sla)
-   - [ADR-004: Terminal vs. Transient Error Handling Strategy (`UnrecoverableError`)](#adr-004-terminal-vs-transient-error-handling-strategy-unrecoverableerror)
-   - [ADR-005: Redis Connection Configuration & The `maxRetriesPerRequest: null` Mandate](#adr-005-redis-connection-configuration--the-maxretriesperrequest-null-mandate)
-   - [ADR-006: Deterministic Two-Phase Graceful Shutdown with Watchdog Timer](#adr-006-deterministic-two-phase-graceful-shutdown-with-watchdog-timer)
-   - [ADR-007: Job Retention, Memory Pruning, and Dead-Letter Inspection](#adr-007-job-retention-memory-pruning-and-dead-letter-inspection)
-   - [ADR-008: In-Worker Attempt Telemetry & Execution Lifecycle Logging](#adr-008-in-worker-attempt-telemetry--execution-lifecycle-logging)
-   - [ADR-009: Empirical End-to-End Retry Backoff & Jitter Verification Harness](#adr-009-empirical-end-to-end-retry-backoff--jitter-verification-harness)
+   - [ADR-004: Terminal vs. Transient Error Handling (`UnrecoverableError`)](#adr-004-terminal-vs-transient-error-handling-unrecoverableerror)
+   - [ADR-005: Redis Connection & `maxRetriesPerRequest: null`](#adr-005-redis-connection--maxretriesperrequest-null)
+   - [ADR-006: Deterministic Two-Phase Graceful Shutdown](#adr-006-deterministic-two-phase-graceful-shutdown)
+   - [ADR-007: Job Retention & Memory Pruning](#adr-007-job-retention--memory-pruning)
+   - [ADR-008: In-Worker Lifecycle Telemetry](#adr-008-in-worker-lifecycle-telemetry)
+   - [ADR-009: Empirical Jitter Verification Harness](#adr-009-empirical-jitter-verification-harness)
+   - [ADR-010: Native Dead-Letter Architecture & Redlock Replay](#adr-010-native-dead-letter-architecture--redlock-replay)
+   - [ADR-011: Edge-Decoupled REST API Ingress & SHA-256 Idempotency](#adr-011-edge-decoupled-rest-api-ingress--sha-256-idempotency)
+   - [ADR-012: In-Memory Throttled Progress Telemetry & On-Demand Polling](#adr-012-in-memory-throttled-progress-telemetry--on-demand-polling)
 4. [Failure Modes & Mitigation Matrix](#4-failure-modes--mitigation-matrix)
-5. [Empirical Load Testing & Verification (550-Job Reverse Benchmark)](#5-empirical-load-testing--verification-550-job-reverse-benchmark)
-6. [Scaling Roadmaps: What I Would Do Differently at 100x Scale](#6-scaling-roadmaps-what-i-would-do-differently-at-100x-scale)
+5. [Load Testing & Invariant Verification](#5-load-testing--invariant-verification)
+6. [Scaling Roadmap (100x Scale)](#6-scaling-roadmap-100x-scale)
 
 ---
 
 ## 1. System Architecture & End-to-End Data Flow
 
-Qrew is a high-throughput, fault-tolerant distributed asynchronous job orchestration engine built in TypeScript. It decouples synchronous user-facing API interactions from compute-intensive and rate-limited downstream workflows (transactional OTP notifications, bulk email broadcasts, and CPU-heavy image transcoding).
+Qrew decouples synchronous API interactions from compute-intensive and rate-limited downstream workflows (transactional OTPs, bulk emails, and image processing).
 
 ```
-   +-----------------------------------------------------------------------+
-   |                            PRODUCER LAYER                             |
-   |                                                                       |
-   |  addNotificationJob()            addEmailJob()         addImageJob()  |
-   |  (P1: CRITICAL, OTP/SMS)     (P2: HIGH, Invoices)    (P3: MED, Image) |
-   +-----------------------------------------------------------------------+
-                                      |
-                       [Atomic Bulk / Pipeline Enqueue]
-                                      v
-   +-----------------------------------------------------------------------+
-   |                       REDIS STORAGE & DATA STRUCTURES                 |
-   |                                                                       |
-   |   bull:my-queue:wait       --> Stream / List (Unprioritized FIFO)     |
-   |   bull:my-queue:prioritized--> ZSET [Score = (priority << 40) | seq]  |
-   |   bull:my-queue:active     --> List (Currently being processed)      |
-   |   bull:my-queue:delayed    --> ZSET [Score = Timestamp for Retry]     |
-   |   bull:my-queue:failed     --> Hash / ZSET (Dead-letter audit)        |
-   |   bull:my-queue:id-counter --> String INCR                            |
-   +-----------------------------------------------------------------------+
-                                      |
-                      [BRPOPLPUSH / Lua Atomic Pull]
-                                      v
-   +-----------------------------------------------------------------------+
-   |                             WORKER LAYER                              |
-   |                                                                       |
-   |  - Concurrency Control: 1 (Configurable per CPU core)                 |
-   |  - Automatic Heartbeat & Lock Extension (prevents stalled pickup)     |
-   |  - Execution Router:                                                  |
-   |      * P1: 200ms simulated external gateway dispatch                  |
-   |      * P2: Schema validation -> 500ms SMTP provider call              |
-   |      * P3: URL validation -> 1000ms Image processing                  |
-   |                                                                       |
-   |  - Error Classification:                                              |
-   |      * Transient (503/429/Network timeout) -> Re-queue to Delayed ZSET|
-   |      * Terminal (Schema error/Invalid email) -> Immediate Unrecoverable|
-   +-----------------------------------------------------------------------+
+  [ HTTP Client / Microservices ]
+                 │
+                 ├── POST /api/v1/jobs (Idempotency-Key + JSON Payload)
+                 ▼
+  ┌────────────────────────────────────────────────────────┐
+  │         REST API Ingress Layer (Express)               │
+  │  - Payload Schema Validation (Fast 400 rejection)      │
+  │  - SHA-256 Canonical Fingerprint & Idempotency Cache   │
+  │  - Returns 202 Accepted + Location Header              │
+  └──────────────────────────┬─────────────────────────────┘
+                             │
+                             ▼
+  ┌────────────────────────────────────────────────────────┐
+  │                 REDIS BROKER (BullMQ)                  │
+  │  bull:my-queue:prioritized  --> ZSET [Score = Priority]│
+  │  bull:my-queue:delayed      --> ZSET [Score = RunAt]   │
+  │  bull:my-queue:active       --> List (In-Flight)       │
+  │  bull:my-queue:failed       --> Hash (DLQ, Capped 1000)│
+  └──────────────────────────┬─────────────────────────────┘
+                             │
+                             ▼
+  ┌────────────────────────────────────────────────────────┐
+  │             WORKER LAYER (Concurrency: 1)              │
+  │  - Auto Heartbeat & Lock Extension (prevents stalls)   │
+  │  - P1: OTP (200ms, Exponential Backoff + 20% Jitter)   │
+  │  - P2: Email (500ms, Exp Backoff + 50% Jitter for 429) │
+  │  - P3: Image (1000ms, Throttled Progress + 30% Jitter) │
+  │  - Terminal Errors --> Immediate PoisonPill Quarantine │
+  └────────────────────────────────────────────────────────┘
 ```
 
-### End-to-End State Lifecycle of a Job
-
-1. **Job Ingestion (`Producer`)**:
-   - The producer invokes `add[Type]Job()` specifying task type, strongly-typed data payload, priority level, retry count, and backoff policy.
-   - BullMQ executes an atomic Lua script on Redis: increments job counter, writes `bull:my-queue:<id>` Hash containing metadata, and pushes the job ID into `bull:my-queue:prioritized` (a Redis Sorted Set keyed by composite score).
-
-2. **Scheduling & Dequeue (`Worker`)**:
-   - The worker runs an atomic Lua script that selects the highest priority job (lowest score in `prioritized`), moves it into `bull:my-queue:active`, acquires an exclusive lock token on `bull:my-queue:<id>:lock`, and begins execution.
-
-3. **Lock Renewal**:
-   - While the job is executing, BullMQ maintains a background lock heartbeat. If the worker process dies or hard-crashes, the lock expires, and a stalled-job monitor moves the job back to `wait` or `prioritized` for re-execution.
-
-4. **Outcome Processing**:
-   - **Success**: The job metadata is shifted to `bull:my-queue:completed`. Retention rules prune completed history to keep memory bounded (`removeOnComplete: 1000`).
-   - **Transient Failure**: An error occurs. BullMQ computes the backoff delay with custom jitter, schedules the job into `bull:my-queue:delayed` with score = `now + delay`, and increments `attemptsMade`.
-   - **Terminal Failure (`UnrecoverableError`) or Max Attempts Exhausted**: The job is moved immediately to `bull:my-queue:failed`. `removeOnFail: false` preserves full stack traces and payload for dead-letter analysis.
+### State Lifecycle
+1. **Ingest**: API validates payload, claims idempotency key, enqueues to Redis `prioritized` ZSET via atomic Lua script, returns `202 Accepted`.
+2. **Dequeue & Lock**: Worker atomically shifts highest-priority job from `prioritized` to `active` and acquires an exclusive lock token.
+3. **Execution & Heartbeat**: Worker renews lock periodically. If worker crashes, stalled-job monitor returns the task to `prioritized`.
+4. **Resolution**:
+   - *Success*: Moved to `completed` (capped at 1,000 records).
+   - *Transient Error*: Scheduled into `delayed` ZSET with exponential backoff + jitter.
+   - *Terminal Error / Poison Pill*: Short-circuits remaining retries via `UnrecoverableError`, landing in `failed` (DLQ).
 
 ---
 
-## 2. Storage & Broker Evaluation: Why Redis + BullMQ Over Alternatives
+## 2. Storage & Broker Evaluation: Redis + BullMQ
 
-When designing a production asynchronous processing queue, choosing the backing persistence and message delivery engine dictates operational complexity, latency, and consistency guarantees. Below is the comparative analysis conducted for Qrew:
-
-| Dimension | **Redis + BullMQ (Selected)** | **Apache Kafka** | **RabbitMQ** | **AWS SQS** | **PostgreSQL (SKIP LOCKED)** |
+| Metric | **Redis + BullMQ (Selected)** | **Apache Kafka** | **RabbitMQ** | **AWS SQS** | **PostgreSQL (SKIP LOCKED)** |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Primary Paradigm** | In-Memory Data Structure Store with Lua atomicity | Distributed Partitioned Append-Only Log | AMQP Message Broker (Push/Exchange queues) | Fully Managed Cloud Queue Service | Relational ACID Database with Row-Level Locks |
-| **End-to-End Latency** | **Sub-millisecond (< 1ms)** | 5ms - 20ms (batch/poll tuned) | 1ms - 5ms | 20ms - 100ms | 5ms - 50ms (Index & WAL overhead) |
-| **Priority Queuing** | **Native O(log N) via Sorted Sets (`ZSET`)** | Anti-pattern; requires separate topic per priority | Supported via max-priority queues (memory heavy) | Not supported; requires multiple queues + worker polling logic | Supported via `ORDER BY priority, created_at` (table bloat risk) |
-| **Delayed & Scheduled Jobs** | **Native O(log N) via delayed `ZSET`** | Unnatural; requires external delay workers or Kafka Streams | Requires Dead Letter Exchange (DLX) + TTL plugins | Supported (up to 15 min max delay) | Supported via `run_at <= NOW()` index polling |
-| **Developer Velocity & Setup** | Single Redis instance or cluster; zero third-party brokers | High operational overhead (ZooKeeper/KRaft, partition sizing) | Moderate (Erlang runtime, vhosts, exchanges) | Zero infra, but cloud vendor locked and poor local dev | Low infra if Postgres already in stack |
-| **Throughput (Single Node)** | **50,000 - 100,000 ops/sec** | 100,000+ ops/sec (sequential disk writes) | 20,000 - 40,000 ops/sec | Managed (scales horizontally, bill per API call) | 2,000 - 10,000 ops/sec (WAL & lock contention) |
-| **Operational Complexity** | Low (Single binary, minimal config, well-understood) | Very High (Partitioning, rebalances, broker management) | Medium (Clustering, network partitions, memory alarms) | Extremely Low (Cloud managed) | Low initially, High as table bloat and vacuuming kick in |
+| **Latency** | **< 1ms (Sub-millisecond)** | 5–20ms | 1–5ms | 20–100ms | 5–50ms |
+| **Priority** | **Native O(log N) via `ZSET`** | Anti-pattern (multi-topic) | Heavy max-priority queues | Not supported natively | Index polling (`ORDER BY`) |
+| **Delay/Schedule** | **Native O(log N) delayed `ZSET`**| External scheduler needed | DLX + TTL dead-letter plugins| Up to 15 min max | `run_at <= NOW()` polling |
+| **Throughput** | **50,000–100,000 ops/sec** | 100,000+ ops/sec | 20,000–40,000 ops/sec | Managed scale | 2,000–5,000 ops/sec |
+| **Dev Parity** | Single binary (`docker run`) | High (ZooKeeper/KRaft) | Erlang runtime & vhosts | Cloud-locked (local mocks) | Low if DB exists |
 
-### Architectural Decision Rationale: Why Redis + BullMQ Won
-
-1. **Sub-Millisecond Tail Latencies for Real-Time Notification Demands**:
-   Critical OTPs and SMS verification tokens cannot tolerate Kafka batching latency or SQS polling roundtrips. In-memory operations in Redis yield sub-5ms roundtrip times from enqueue to worker pickup.
-2. **First-Class Priority and Delay Support**:
-   Kafka is an immutable partitioned log. It has *no concept* of message priority; high-priority messages stuck behind a slow partition cannot jump the queue without spinning up dedicated priority topics. Redis Sorted Sets allow arbitrary priority insertion and re-ranking in $O(\log N)$ time.
-3. **Atomic Lua Scripts Prevent Distributed Race Conditions**:
-   State transitions in BullMQ (e.g., claiming a job, renewing a lock, moving from delayed to active) are orchestrated via atomic server-side Lua scripts in Redis. This guarantees zero race conditions even with 100 distributed worker nodes contending for the same queue.
-4. **Local Dev Parity & Self-Contained Deployment**:
-   Developers can spin up a fully compliant environment with a single `docker run -p 6379:6379 redis:alpine` command, eliminating the need to mock complex AWS SQS endpoints or orchestrate Kafka clusters during local unit and integration tests.
+**Why Redis Won:** Real-time OTPs demand sub-5ms roundtrips. Redis Sorted Sets provide native O(log N) dynamic priority and arbitrary retry delays without external schedulers, orchestrated atomically via Lua scripts.
 
 ---
 
 ## 3. Architectural Decision Records (ADRs)
 
----
-
-### ADR-001: Message Broker & Queue Abstraction Engine
-
-* **Status:** Accepted  
-* **Date:** 2026-10-19  
-* **Deciders:** [makx-dev](https://github.com/makx-dev)  
-
-#### Context
-Qrew requires an asynchronous task processing engine to manage varying workloads: real-time OTP notifications (latency-sensitive), transactional customer emails (rate-limited upstream), and image transformations (compute-heavy). The system requires dynamic job prioritization, configurable retry mechanisms, job event hooks, and worker concurrency controls.
-
-#### Decision
-I selected **BullMQ backed by Redis (via `ioredis`)**. I encapsulated queue definitions in `src/producer.ts` and worker execution logic in `src/worker.ts`, sharing typed contracts defined in `src/JobTypes.ts`.
-
-#### Alternatives Considered
-1. **Apache Kafka**: Evaluated for distributed streaming log throughput. Rejected due to high operational complexity (broker cluster, partition management) and lack of native message priority or arbitrary delay scheduling without external orchestrators.
-2. **RabbitMQ (AMQP)**: Evaluated for AMQP routing and priority queue support. Rejected due to Erlang dependency overhead, complex cluster recovery under network partitions, and heavy memory overhead under deep backlogs.
-3. **AWS SQS**: Evaluated as a fully managed cloud queue. Rejected due to lack of sub-millisecond dispatch latency (20-100ms HTTP polling overhead), vendor lock-in, and high friction in local development/testing without cloud emulators.
-4. **PostgreSQL (`FOR UPDATE SKIP LOCKED`)**: Evaluated to reuse an existing relational database. Rejected due to table bloat from rapid write/update/delete churn, WAL write overhead, and lock contention limiting throughput to ~2,000–5,000 ops/sec.
-
-#### Consequences
-* **Positive:**
-  - Full TypeScript integration with end-to-end payload typing.
-  - Granular control over retries, backoff, delays, and stalled job recovery out of the box.
-  - High raw throughput with minimal CPU overhead on the broker side.
-* **Negative:**
-  - In-memory constraint: Redis requires careful memory monitoring and eviction policy management (`noeviction`).
-  - Redis restart without persistent storage (AOF/RDB) can cause queue state loss.
+### ADR-001: Broker & Queue Abstraction Engine
+* **Status:** Accepted | **Date:** 2026-10-19
+* **Context:** Needed a high-throughput, low-latency task engine supporting dynamic priority, arbitrary delays, and TypeScript types.
+* **Decision:** Selected **BullMQ + Redis (`ioredis`)**. Strongly typed job contracts (`JobTypes.ts`) shared between producer and worker.
+* **Alternatives Considered:**
+  - *Apache Kafka:* High operational complexity, no native priority or arbitrary delay scheduling without external orchestrators.
+  - *RabbitMQ (AMQP):* Erlang dependency, complex partition recovery, high memory footprint on deep queues.
+  - *AWS SQS:* 20–100ms HTTP polling latency, poor local dev parity, vendor lock-in.
+  - *PostgreSQL (`SKIP LOCKED`):* Table bloat from write churn, WAL write overhead, lock contention capping throughput at 2,000–5,000 ops/sec.
+* **Trade-off:** High throughput and low latency; requires Redis RAM monitoring and `noeviction` policy to prevent data loss.
 
 ---
 
-### ADR-002: Strict Priority Scheduling via Redis Sorted Sets (`ZSET`)
-
-* **Status:** Accepted  
-* **Date:** 2026-10-21  
-* **Deciders:** [makx-dev](https://github.com/makx-dev)  
-
-#### Context
-Different jobs possess radically different business impacts:
-- **Critical (Priority 1):** One-Time Passwords (OTP) and login verification codes. User is actively waiting on a screen.
-- **High (Priority 2):** Transactional billing receipts, booking confirmations. Must arrive within seconds.
-- **Medium (Priority 3):** Background image resizing and avatar cropping. Best-effort, can tolerate minutes of delay.
-
-If a batch of 500 image resizing tasks arrives, they must not starve an incoming OTP notification.
-
-#### Decision
-I formalized an explicit priority enum in `JobTypes.ts`:
-```typescript
-export enum JobPriority {
-    CRITICAL = 1, // OTP, Password Reset
-    HIGH = 2,     // Transaction Emails
-    MEDIUM = 3,   // Image Resizing
-}
-```
-In BullMQ, lower numerical priority indicates higher precedence. Jobs are stored in the Redis Sorted Set `bull:<queue>:prioritized`, where the score encodes the priority. BullMQ's worker Lua script pulls jobs with the lowest score first.
-
-#### Alternatives Considered
-1. **Multiple Dedicated FIFO Queues (One per priority)**: Polling `queue:critical`, then `queue:high`, then `queue:medium` sequentially using `BLPOP queue:critical queue:high queue:medium`. Rejected at this phase to minimize connection and queue proliferation for simple single-worker setups, favoring BullMQ's native composite score `ZSET` ordering (`(priority << 40) | seq`).
-2. **Application-Level In-Memory Priority Queue (Min-Heap in Node.js)**: Sorting jobs in Node.js process memory. Rejected because in-memory state is lost on worker restart and cannot scale across multiple distributed worker nodes.
-3. **Dynamic Weighting / Deficit Round Robin**: Allocating probabilistic execution slots (e.g., 3:2:1 ratio). Rejected because OTP and verification codes require deterministic preemption, not statistical scheduling.
-
-#### Consequences
-* **Positive:**
-  - Critical jobs automatically jump to the front of the queue even if millions of Medium jobs are already queued.
-  - Deterministic processing order validated empirically through a 550-job reverse-priority load test.
-* **Negative:**
-  - **Starvation Risk**: If the producer continuously floods the queue with Priority 1 jobs, Priority 3 jobs may never execute. (Addressed in [Section 6](#6-scaling-roadmaps-what-i-would-do-differently-at-100x-scale)).
+### ADR-002: Strict Priority Scheduling via Sorted Sets (`ZSET`)
+* **Status:** Accepted | **Date:** 2026-10-21
+* **Context:** Critical OTPs must never be starved behind bulk image processing or marketing emails.
+* **Decision:** Defined numerical priority enum (`CRITICAL = 1`, `HIGH = 2`, `MEDIUM = 3`). BullMQ maps priority to Redis `ZSET` scores (`(priority << 40) | seq`), ensuring lower numerical scores dequeue first in $O(\log N)$ time.
+* **Alternatives Considered:**
+  - *Dedicated FIFO Queues per Priority:* Polling `queue:critical`, then `high`, then `medium` increases connection and queue proliferation; deferred to multi-worker scaling phase.
+  - *In-Memory Min-Heap (Node.js Process):* State lost on process crash; cannot coordinate across distributed worker instances.
+  - *Deficit Weighted Round Robin (e.g. 3:2:1 ratio):* Statistical rather than deterministic; critical OTPs demand absolute preemption.
+* **Trade-off:** Critical jobs preempt lower tiers instantly; requires multi-queue dedicated worker pools if critical traffic floods continuously.
 
 ---
 
 ### ADR-003: Tiered Retry Backoff with Jitter Tailored by Job SLA
-
-* **Status:** Accepted (Active in Working Tree)  
-* **Date:** 2026-10-23  
-* **Deciders:** [makx-dev](https://github.com/makx-dev)  
-
-#### Context
-External downstream dependencies fail in different ways:
-1. SMS gateways fail intermittently due to quick cellular handshakes or temporary socket reset.
-2. Email APIs (e.g., SendGrid, Resend, SES) enforce strict per-second rate limits (HTTP 429 Too Many Requests).
-3. Image fetch servers fail due to heavy asset downloads or temporary CDN 503 errors.
-
-In the initial implementation (2026-10-21), jobs used naive 500ms exponential retries with zero jitter, while image processing had no backoff and only 2 attempts. Under load spikes, this triggered downstream **Thundering Herd collisions**: hundreds of rate-limited email jobs retried at identical millisecond timestamps, generating cascading 429 errors.
-
-#### Decision
-On 2026-10-23, I upgraded `src/producer.ts` to implement differentiated retry counts, specialized backoff models, and randomized jitter percentages customized to each task's operational SLA:
-
-```typescript
-// 1. Critical Notification: Tight retry, minimal delay, 20% jitter
-attempts: 3,
-backoff: {
-    type: 'exponential',
-    delay: 500, // 500ms base
-    jitter: 0.2  // +/- 20% variance (400ms - 600ms)
-}
-
-// 2. High-Priority Email: Exponential backoff, 50% wide jitter for rate limits
-attempts: 5,
-backoff: {
-    type: 'exponential',
-    delay: 2000, // 2s -> 4s -> 8s -> 16s
-    jitter: 0.5   // +/- 50% variance spreads retries over several seconds
-}
-
-// 3. Medium-Priority Image Processing: Fixed backoff, conservative delay
-attempts: 3,
-backoff: {
-    type: 'fixed',
-    delay: 10000, // 10s wait
-    jitter: 0.3   // +/- 30% variance (7s - 13s)
-}
-```
-
-#### Alternatives Considered
-1. **Uniform Immediate Retry (No delay)**: Retrying immediately upon failure. Rejected because downstream API outages or rate limits (HTTP 429) persist across consecutive milliseconds, resulting in rapid exhaustion of retry budgets.
-2. **Static Fixed Interval (e.g., retry every 5s across all jobs)**: Rejected because it fails to protect against the Thundering Herd Problem—if 1,000 jobs fail at time $T$, all 1,000 retry simultaneously at $T+5s$, inducing secondary outages. Furthermore, delaying critical OTPs by 5 seconds degrades user authentication SLA.
-3. **Standard Exponential Backoff Without Jitter**: Standard $delay = base \cdot 2^{attempt}$. Rejected because synchronized retries still clump together in discrete waves at each exponential interval. Adding randomized fractional jitter (20% to 50%) is mathematically required to distribute retry arrivals smoothly over time.
-
-#### Consequences
-* **Positive:**
-  - **Jitter de-synchronizes worker retries**, smoothing the downstream request curve into a flat distribution and absorbing rate-limit windows.
-  - Critical OTPs fail fast or recover rapidly within 1.5 seconds, while emails get 5 sustained attempts across exponential windows.
-* **Negative:**
-  - Jobs occupying retry slots sit in the Redis `delayed` sorted set until their timestamp expires, consuming small amounts of Redis memory.
+* **Status:** Accepted | **Date:** 2026-10-23
+* **Context:** Naive uniform retries caused downstream thundering herd collisions and rate limit (HTTP 429) cascades.
+* **Decision:** Tiered backoff and jitter by job sensitivity:
+  - `notification`: 3 attempts, exponential backoff (500ms base, 20% jitter) for fast recovery.
+  - `email`: 5 attempts, exponential backoff (2,000ms base, 50% wide jitter) to absorb downstream 429 rate limits.
+  - `image-processing`: 3 attempts, fixed backoff (10,000ms base, 30% jitter) for transient CDN timeouts.
+* **Alternatives Considered:**
+  - *Uniform Immediate Retry:* Exhausts retry budget instantly across consecutive milliseconds of external API downtime.
+  - *Fixed Interval Without Jitter (e.g. 5s across all jobs):* Induces Thundering Herd where hundreds of failed jobs retry in synchronized discrete waves.
+  - *Pure Exponential Backoff Without Jitter:* Synchronized retries still clump in discrete waves ($2^n$); randomized fractional jitter mathematically desynchronizes arrival curves.
+* **Trade-off:** Flattens retry spikes across time; retrying jobs temporarily occupy slots in Redis `delayed` set.
 
 ---
 
-### ADR-004: Terminal vs. Transient Error Handling Strategy (`UnrecoverableError`)
-
-* **Status:** Accepted (Active in Working Tree)  
-* **Date:** 2026-10-23  
-* **Deciders:** [makx-dev](https://github.com/makx-dev)  
-
-#### Context
-Errors in a worker pipeline fall into two fundamentally distinct categories:
-1. **Transient Errors:** Network timeouts, downstream 500/503/429 HTTP statuses, temporary database connection pool exhaustion. *These should be retried.*
-2. **Terminal (Poison Pill) Errors:** Malformed payloads, invalid recipient email addresses, corrupted image URLs, missing authentication credentials. *Retrying these is completely futile, wastes CPU cycles, incurs external API costs, and clogs the queue.*
-
-Prior to 2026-10-23, the worker lacked pre-execution input guards. Malformed email addresses (e.g., `invalid@@domain`) or broken URLs blindly cycled through all retry attempts with exponential backoff delays, wasting resources before dying.
-
-#### Decision
-On 2026-10-23, I introduced strict defensive validation guards (`isValidEmail`, `isValidImage`) in `src/worker.ts` paired with BullMQ's native `UnrecoverableError`:
-
-```typescript
-if (!isValidEmail(job.data.to)) {
-    throw new UnrecoverableError(`Invalid email address ${job.data.to}`);
-}
-
-if (!isValidImage(job.data.imageUrl)) {
-    throw new UnrecoverableError(`Invalid image URL ${job.data.imageUrl}`);
-}
-```
-
-When `UnrecoverableError` is thrown:
-- BullMQ **immediately aborts** all remaining attempts (even if `attempts: 5` was configured).
-- The job transitions straight to the `failed` state.
-- The `failed` event triggers, and the payload is preserved for engineer review without re-executing.
-
-#### Alternatives Considered
-1. **Catch-All Blind Retries**: Allowing the standard retry loop (3–5 attempts) to run on every thrown error. Rejected because deterministic failures (e.g. malformed email address `bad@@email`, corrupted image URL) will never succeed on subsequent attempts, needlessly consuming worker CPU time and third-party API quotas.
-2. **Custom Error Hierarchy with Manual Queue Manipulation**: Creating custom error subclasses and manually removing the job from Redis within the worker catch block. Rejected because it introduces error-prone boilerplate and bypasses BullMQ's built-in state machine transitions to the `failed` set.
-3. **Dead-Letter Shunting via Secondary Producer**: Catching validation errors and re-enqueuing directly to a dedicated `quarantine-queue`. Rejected as redundant since BullMQ's native `UnrecoverableError` preserves the job directly in `bull:my-queue:failed` with stack trace intact.
-
-#### Consequences
-* **Positive:**
-  - Prevents queue congestion from poisoned jobs.
-  - Saves API credits and eliminates needless compute on dead payloads.
-  - Clear operational separation in telemetry: transient alerts vs. business validation bugs.
-* **Negative:**
-  - Validation logic inside worker functions must be rigorous; falsely throwing `UnrecoverableError` on a recoverable error permanently cancels the job.
+### ADR-004: Terminal vs. Transient Error Handling (`UnrecoverableError`)
+* **Status:** Accepted | **Date:** 2026-10-23
+* **Context:** Deterministic errors (malformed emails, broken image URLs) repeatedly retried, wasting API credits and compute.
+* **Decision:** Guard worker handlers with input validation (`isValidEmail`, `isValidImage`). Throws `UnrecoverableError` / `PoisonPillError` on schema violations, aborting remaining attempts immediately and routing directly to the `failed` set.
+* **Alternatives Considered:**
+  - *Blind Catch-All Retries:* Deterministic bugs (invalid email, malformed URL) retry 3–5 times, wasting worker CPU and third-party API quotas before dying.
+  - *Manual Queue Removal via Catch Block:* Error-prone boilerplate that bypasses BullMQ's native Lua state machine.
+  - *Auxiliary Quarantine Queue Producer:* Redundant; BullMQ natively shunts unrecoverable jobs straight to the `failed` set with stack traces preserved.
+* **Trade-off:** Eliminates wasted compute on poison pills; requires strict validation logic to avoid falsely failing recoverable jobs.
 
 ---
 
-### ADR-005: Redis Connection Configuration & The `maxRetriesPerRequest: null` Mandate
-
-* **Status:** Accepted  
-* **Date:** 2026-10-19  
-* **Deciders:** [makx-dev](https://github.com/makx-dev)  
-
-#### Context
-BullMQ utilizes long-running blocking commands (such as `BRPOPLPUSH` / `BZPOPMIN`) and custom Lua script executions to coordinate distributed queues. Standard `ioredis` instances are configured with default request retries (`maxRetriesPerRequest: 20`). 
-
-When a blocking command is waiting for a job on an empty queue, or during temporary network blips, `ioredis` default retry counters exhaust, throwing:
-`Error: maxRetriesPerRequest reached`. This crashes BullMQ worker instances unexpectedly.
-
-#### Decision
-In `src/redis-connection.ts`, I explicitly set `maxRetriesPerRequest: null`:
-
-```typescript
-export const redisConnection = new IORedis({
-    host: process.env.REDIS_HOST ?? 'localhost',
-    port: Number(process.env.REDIS_PORT ?? 6379),
-    password: process.env.REDIS_PASSWORD,
-    maxRetriesPerRequest: null, // REQUIRED by BullMQ
-    tls: process.env.REDIS_TLS === '1' ? {} : undefined,
-    connectionName: 'Qrew-Main-Connection',
-});
-```
-
-#### Alternatives Considered
-1. **High Finite Retries (`maxRetriesPerRequest: 100`)**: Increasing the default from 20 to a large integer. Rejected because long idle periods between bursts of traffic or temporary Redis master failovers (>30s) still hit the ceiling and trigger unhandled promise rejections, crashing the worker process.
-2. **Separate Connections for Blocking and Command Operations with Default Retries**: Maintaining default retry behavior on producers while setting `null` only on workers. Rejected because it introduces configuration drift; BullMQ's official contract mandates `maxRetriesPerRequest: null` across all Redis instances shared with queues and workers to handle atomic multi-command Lua evaluations reliably.
-3. **Catching Unhandled Rejection at Process Level (`uncaughtException`)**: Swallowing the error globally. Rejected as a dangerous anti-pattern that conceals connection leaks and leaves workers in a zombie state.
-
-#### Consequences
-* **Positive:**
-  - Prevents fatal crashes during idle queue states and command blockings.
-  - Guarantees seamless client reconnection when Redis undergoes managed failover or restarts.
-* **Negative:**
-  - If Redis becomes permanently unreachable, commands queue up in memory until the Node.js process exhausts heap unless an upper timeout or monitor triggers.
+### ADR-005: Redis Connection & `maxRetriesPerRequest: null`
+* **Status:** Accepted | **Date:** 2026-10-19
+* **Context:** BullMQ blocking commands (`BRPOPLPUSH`) trigger `ioredis` default retry limit exceptions (`maxRetriesPerRequest reached`), crashing workers during idle queue periods.
+* **Decision:** Mandated `maxRetriesPerRequest: null` across all shared `ioredis` instances.
+* **Alternatives Considered:**
+  - *High Finite Retries (`maxRetriesPerRequest: 100`):* Idle periods on empty queues or managed failover delays (>30s) still hit the ceiling, crashing workers.
+  - *Separate Connections for Blocking vs Normal Commands:* Creates configuration drift; BullMQ's contract mandates `null` across all shared connections.
+  - *Global Process Error Swallowing (`uncaughtException`):* Anti-pattern that conceals connection leaks and leaves workers in zombie states.
+* **Trade-off:** Prevents idle crashes and enables automatic recovery across Redis restarts; commands buffer in memory if Redis disconnects permanently.
 
 ---
 
-### ADR-006: Deterministic Two-Phase Graceful Shutdown with Watchdog Timer
-
-* **Status:** Accepted  
-* **Date:** 2026-10-20  
-* **Deciders:** [makx-dev](https://github.com/makx-dev)  
-
-#### Context
-When deploying new code or restarting worker containers in Kubernetes/Docker, the OS issues `SIGTERM` or `SIGINT`. If a worker abruptly halts:
-- Active jobs are terminated midway through execution (e.g., an image resizing job is cut off after 80% work).
-- Redis locks remain held until the lock timeout expires (typically 30 seconds), causing duplicate work or stalled job delays.
-- On Windows operating systems, standard Node.js process listeners often fail to trap `SIGINT` (Ctrl+C) due to console handle differences.
-
-#### Decision
-I implemented a two-phase graceful shutdown system in `src/worker-runner.ts`:
-1. **Windows Console Emulation**: Using `readline` to explicitly emit `SIGINT` when running under `process.platform === 'win32'`.
-2. **Worker Draining**: Calling `await worker.close()` which ceases pulling new jobs while allowing currently running jobs to complete.
-3. **Connection Teardown**: Calling `await redisConnection.quit()` only after the worker has completely terminated.
-4. **Hard Watchdog Timer**: A 10-second force-kill timeout (`setTimeout(..., 10000).unref()`) guarantees the process never hangs indefinitely if a job hangs.
-
-```typescript
-const onSignal = async () => {
-    if (isShuttingDown) return;
-    isShuttingDown = true;
-
-    const forceExitTimer = setTimeout(() => {
-        console.log("Force exiting after 10 seconds");
-        process.exit(1);
-    }, 10000);
-    forceExitTimer.unref();
-
-    try {
-        await shutdownWorker();      // 1. Drain active jobs
-        await redisConnection.quit(); // 2. Cleanly close Redis socket
-        clearTimeout(forceExitTimer);
-        process.exit(0);
-    } catch (error) {
-        process.exit(1);
-    }
-};
-```
-
-#### Alternatives Considered
-1. **Immediate Process Exit (`process.exit(0)` on SIGINT/SIGTERM)**: Killing the process synchronously upon signal reception. Rejected because active jobs are aborted mid-flight, leaving locks stranded in Redis and requiring stalled-job recovery timeouts before other workers can re-execute them.
-2. **Indefinite Waiting on `worker.close()`**: Awaiting worker drain without a hard ceiling. Rejected because if an external HTTP request hangs indefinitely or a job enters an infinite loop, the container will never exit, blocking CI/CD rollouts and Kubernetes pod terminations.
-3. **Relying Exclusively on Docker/K8s SIGKILL (30s default timeout)**: Allowing container runtime to forcibly kill the worker. Rejected because abrupt termination leaves Redis state unclean and causes unnecessary failed job alerts. A 10s application-level watchdog timer ensures clean shutdown well before orchestrator timeouts.
-
-#### Consequences
-* **Positive:**
-  - Zero dropped jobs during rolling Kubernetes deployments.
-  - Eliminates "stalled job" recovery delays upon application restarts.
-  - Clean cross-platform behavior (works identically in Linux production containers and local Windows development).
-* **Negative:**
-  - Container orchestrators must be configured with a termination grace period (`terminationGracePeriodSeconds`) greater than the watchdog timer (e.g., 15–30s).
+### ADR-006: Deterministic Two-Phase Graceful Shutdown
+* **Status:** Accepted | **Date:** 2026-10-20
+* **Context:** Worker termination mid-job leaves Redis locks orphaned (causing 30s stalled delays) and fails to catch `SIGINT` on Windows consoles.
+* **Decision:** Implemented two-phase shutdown in `worker-runner.ts`:
+  1. `worker.close()` stops accepting new jobs and drains active jobs.
+  2. `redisConnection.quit()` cleanly closes client sockets.
+  3. 10-second unreferenced watchdog timer (`setTimeout(..., 10000).unref()`) prevents hung processes.
+* **Alternatives Considered:**
+  - *Immediate Exit (`process.exit(0)` on signal):* Aborts in-flight jobs midway, leaving locks stranded in Redis until stalled-job timeouts expire (30s delay).
+  - *Indefinite Wait on `worker.close()`:* Hanging external HTTP calls or infinite loops would block deployments indefinitely.
+  - *Relying Exclusively on Docker/K8s SIGKILL:* Abrupt SIGKILL leaves Redis state unclean and causes unnecessary alert noise.
+* **Trade-off:** Zero aborted jobs during deployments; requires container orchestrators to allow $\ge 15\text{s}$ termination grace periods.
 
 ---
 
-### ADR-007: Job Retention, Memory Pruning, and Dead-Letter Inspection
-
-* **Status:** Accepted  
-* **Date:** 2026-10-19  
-* **Deciders:** [makx-dev](https://github.com/makx-dev)  
-
-#### Context
-Redis is an in-memory data store. In a system processing 500,000 jobs per day:
-- If completed jobs are retained indefinitely, Redis memory usage grows monotonically until the operating system triggers the OOM killer or Redis hits `maxmemory`.
-- Conversely, if failed jobs are discarded automatically, developers cannot debug root causes, inspect stack traces, or re-run dropped transactions.
-
-#### Decision
-I implemented differentiated retention rules across all producers:
-```typescript
-{
-    removeOnComplete: 1000, // Keep only the latest 1,000 completed jobs
-    removeOnFail: false     // NEVER automatically delete failed jobs
-}
-```
-
-#### Alternatives Considered
-1. **Total Job Deletion (`removeOnComplete: true`, `removeOnFail: true`)**: Discarding all jobs immediately upon completion or failure. Rejected because operational triage becomes impossible—engineers cannot inspect failed job stack traces, input payloads, or reproduce customer bug reports.
-2. **Uncapped Retention (`removeOnComplete: false`, `removeOnFail: false`)**: Preserving all jobs permanently in Redis. Rejected because Redis memory is RAM-bounded; at hundreds of thousands of daily jobs, Redis rapidly suffers OOM or eviction crashes.
-3. **Time-To-Live (TTL) Based Eviction (`removeOnComplete: { age: 3600 }`)**: Retaining jobs by duration (e.g., 1 hour). Rejected because during unexpected high-volume spikes, memory consumption scales uncontrollably with job velocity rather than staying strictly count-bounded (`1000` jobs).
-
-#### Consequences
-* **Positive:**
-  - **Bounded Memory Footprint**: Completed jobs are automatically ring-buffered to the most recent 1,000 records, preventing memory leaks.
-  - **Dead-Letter Auditability**: Failed jobs remain in the `failed` set as a built-in Dead Letter Queue (DLQ). Engineers can inspect `job.failedReason` and `job.stacktrace`, patch the code, and trigger programmatic retries.
-* **Negative:**
-  - High rates of continuous failures can still consume memory if left unmonitored. (Requires alerting on `failed` set size).
+### ADR-007: Job Retention & Memory Pruning
+* **Status:** Superseded & Refined by ADR-010 | **Date:** 2026-10-19
+* **Context:** Redis memory grows monotonically if completed/failed jobs are retained indefinitely.
+* **Decision:** Capped completed jobs to `removeOnComplete: 1000`. Failed jobs retained for dead-letter analysis (initially `removeOnFail: false`, capped to `1000` in ADR-010).
+* **Alternatives Considered:**
+  - *Immediate Total Deletion (`removeOnComplete: true`, `removeOnFail: true`):* Prevents operational triage—engineers cannot inspect payloads or stack traces to debug issues.
+  - *Uncapped Permanent Retention:* Consumes unbounded Redis RAM, leading to OOM kills under sustained volume.
+  - *Time-To-Live Eviction (`age: 3600`):* Memory footprint scales unpredictably with ingestion spikes; count-based limits (`1000`) guarantee a fixed upper memory bound.
+* **Trade-off:** Limits Redis memory usage to bounded ring-buffers; historical metrics beyond 1,000 jobs must be shipped to external telemetry.
 
 ---
 
-### ADR-008: In-Worker Attempt Telemetry & Execution Lifecycle Logging
-
-* **Status:** Accepted (Active in Working Tree)  
-* **Date:** 2026-10-23  
-* **Deciders:** [makx-dev](https://github.com/makx-dev)  
-
-#### Context
-As jobs transition through retry cycles governed by exponential backoff and jitter (ADR-003), diagnosing worker behavior in distributed systems requires knowing the exact attempt iteration (`attemptsMade + 1`) relative to the allocated retry ceiling (`opts.attempts`). 
-
-Standard BullMQ lifecycle events (`worker.on('failed')`, `worker.on('completed')`) only fire *after* a job attempt has fully terminated. While a long-running, CPU-intensive, or rate-limited job is executing, operators and APM collectors had no real-time visibility into whether the current run was attempt #1 or the final attempt #5 before fatal DLQ quarantine.
-
-#### Decision
-On 2026-10-23, I implemented granular in-worker lifecycle telemetry inside `src/worker.ts`:
-```typescript
-console.log(
-    `[START] Processing ${job.name} (Priority: ${priority}, ID: ${job.id}, Attempt: ${job.attemptsMade + 1}/${job.opts.attempts})`
-);
-```
-Every job handler prints structured diagnostic markers containing:
-1. **Job Type** (`job.name`)
-2. **Numerical / Categorical Priority** (`priority`)
-3. **Unique Job Identifier** (`job.id`)
-4. **Explicit Attempt Index** (`job.attemptsMade + 1` of `job.opts.attempts`)
-
-#### Alternatives Considered
-1. **Relying Exclusively on Worker Event Listeners (`worker.on('progress')` / `worker.on('active')`)**: BullMQ provides an `active` event, but it emits globally across all workers without immediate contextual payload correlation inside the task switch statement. Putting logging directly in the worker handler provides zero-latency correlation with the exact execution branch.
-2. **Heavy APM / Distributed Trace Spans Only (OpenTelemetry / Datadog)**: While planned for future 100x scale (Section 6), injecting full tracer libraries at this phase introduces external agent dependencies and slows local integration testing. Structured stdout output provides immediate, universal readability across Docker, Kubernetes `kubectl logs`, and local CLI runners.
-3. **Polling Redis Job Metadata via BullMQ CLI or HTTP API**: Polling `job.asJSON()` from an external monitoring sidecar adds unnecessary network roundtrips to Redis and fails to guarantee synchronization with real-time execution progress.
-
-#### Consequences
-* **Positive:**
-  - Real-time observability into retry progress and backoff jitter execution directly in container logs.
-  - Immediate operational feedback distinguishing between initial attempt failures and persistent retry exhaustion.
-  - Zero performance overhead (single string interpolation per job).
-* **Negative:**
-  - Increased log volume under high-throughput saturation. (Will be filtered by log level or sampled at larger scale).
+### ADR-008: In-Worker Lifecycle Telemetry
+* **Status:** Accepted | **Date:** 2026-10-23
+* **Context:** Standard BullMQ events only fire after an attempt finishes, leaving zero real-time visibility into in-flight attempt indices.
+* **Decision:** Worker prints structured stdout diagnostic markers on execution start:
+  `[START] Processing {name} (Priority: {p}, ID: {id}, Attempt: {attemptsMade + 1}/{opts.attempts})`.
+* **Alternatives Considered:**
+  - *Relying Only on Global Worker Events (`worker.on('active')`):* Emits globally without contextual correlation with in-flight handler branch execution.
+  - *Heavy APM Tracer Libraries (OpenTelemetry/Datadog):* Deferred to larger scale; adds heavy agent overhead during local dev and testing.
+  - *Polling Redis Metadata Externally:* Incurs extra Redis roundtrips and lacks millisecond synchronization with real-time execution.
+* **Trade-off:** Universal visibility across Docker/K8s logs with zero external APM dependencies; adds minor stdout volume.
 
 ---
 
-### ADR-009: Empirical End-to-End Retry Backoff & Jitter Verification Harness
+### ADR-009: Empirical Jitter Verification Harness
+* **Status:** Accepted | **Date:** 2026-10-24
+* **Context:** Randomized jitter ($ \pm 50\% $) causes consecutive retry intervals to overlap, causing naive monotonic assertions (`delays[i] > delays[i-1]`) to fail flakily in CI/CD.
+* **Decision:** Built `src/verify-retries.ts` with a parameterized `verifyWindows()` assertion model:
+  $$\text{window}_i = \big[\, \text{nominal} \cdot (1 - \text{jitter}) - \text{buffer}, \;\; \text{nominal} + \text{buffer} \,\big]$$
+  Validates that actual measured retry deltas strictly fall within mathematical bounds while absorbing socket roundtrips.
+* **Alternatives Considered:**
+  - *Strict Monotonic Inequality (`delays[i] > delays[i-1]`):* When jitter $\ge 50\%$, interval bounds collide, producing false-negative flaky CI failures under minor event-loop lag.
+  - *Mocking Redis (`ioredis-mock`):* Doesn't execute BullMQ Lua scripts or Redis delayed ZSET polling, hiding real-world timing bugs.
+  - *Manual Stop-Watch Log Auditing:* Error-prone, non-repeatable, and untestable in automated CI/CD pipelines.
+* **Trade-off:** Deterministic, non-flaky retry verification; test suite takes ~35s waiting on genuine Redis delay timers.
 
-* **Status:** Accepted (Active in Working Tree)  
-* **Date:** 2026-10-24  
-* **Deciders:** [makx-dev](https://github.com/makx-dev)  
+---
 
-#### Context
-While ADR-003 established the tiered retry backoff policies (exponential for Notification and Email, fixed for Image Processing) and ADR-008 introduced in-worker attempt counters, distributed retry systems remain susceptible to silent operational regressions:
-1. **Mathematical Drift & Overlapping Jitter**: With high jitter percentages (e.g., $\pm 50\%$ on Email), consecutive retry intervals can probabilistically overlap if base formulas or random seed distributions are incorrectly tuned.
-2. **Failure Type Inversion**: Transient errors must trigger Redis-scheduled retries, whereas unrecoverable validation failures must short-circuit immediately into the Dead Letter Queue (`failed` set).
-3. **Connection Collisions in Test Runtimes**: Attempting to monitor retry events using BullMQ's `QueueEvents` with shared `IORedis` connections can lock the socket in blocking pub/sub mode, stalling worker progress.
+### ADR-010: Native Dead-Letter Architecture & Redlock Replay
+* **Status:** Accepted | **Date:** 2026-10-29
+* **Context:** Uncapped failed jobs threatened Redis OOM. Automated replays lacked poison pill guards, risking infinite retry loops and concurrent race conditions.
+* **Decision:**
+  1. **Capped DLQ Retention:** Configured `removeOnFail: { count: 1000 }` on native failed sets.
+  2. **Memory Policy:** Enforced `maxmemory-policy noeviction` via `ensureRedisNoEviction()`.
+  3. **Bounded Replay Ceiling:** Replay service tracks `_replayCount`. Jobs exceeding 3 replay cycles are permanently escalated to poison pills.
+  4. **Distributed Replay Lock:** `inspectAndReplayFailedJobs()` acquires Redlock on `lock:replay:<queueName>` (30s TTL) to prevent duplicate execution across admin instances.
+  5. **Concurrency Ceiling:** Fixed at `concurrency: 1` to guarantee serial processing and avoid 429 cascades.
+* **Alternatives Considered:**
+  - *Secondary Auxiliary DLQ Queue (`my-queue-dlq`):* Duplicates jobs, creates new IDs, breaks provenance, and requires dual-queue maintenance.
+  - *Uncapped Failed Job Retention:* Prolonged outages fill Redis RAM until OOM crash.
+  - *Automated Infinite Replay:* Persistent failures loop forever, creating infinite log spam and third-party API costs.
+  - *Unsynchronized Replay Execution:* Multiple admin pods pull the same failed jobs concurrently, triggering duplicate executions.
+* **Trade-off:** Memory-safe, poison-pill-resilient DLQ; jobs exceeding 1,000 failures are pruned from Redis.
 
-Without an automated, reproducible verification harness, engineers had to rely on manual timestamp inspection or mock-based unit tests that fail to validate Redis sorted set delay scheduling.
+---
 
-#### Decision
-On 2026-10-24, I designed and implemented an empirical, automated retry verification suite in `src/verify-retries.ts`, exposed via `npm run test:retry` in `package.json`:
+### ADR-011: Edge-Decoupled REST API Ingress & SHA-256 Idempotency
+* **Status:** Accepted | **Date:** 2026-10-31
+* **Context:** Direct Redis access tightly couples external clients to internal broker credentials and drivers, lacks ingress validation, and allows network retry storms to create duplicate jobs.
+* **Decision:** Built Express REST API (`src/api-server.ts`) with Redis-backed `IdempotencyManager` (`src/idempotency.ts`):
+  1. **Strict Ingress Validation & `202 Accepted`:** Validates schemas synchronously (400 on error), returns `202 Accepted` with `Location` header.
+  2. **SHA-256 Cryptographic Idempotency:**
+     - Computes canonical `SHA-256(Body)`.
+     - Claims Redis lease via `SET idempotency:<key> {"status":"PROCESSING"} NX EX 60`.
+     - Rejects altered payloads reusing the same key with `422 Unprocessable Entity`.
+     - Rejects parallel requests with `409 Conflict`.
+     - Caches successful 202 response for 24h (`86400s`).
+     - Releases lock (`DEL`) on enqueue failure for immediate client retry.
+  3. **Unified Observability:** `GET /api/v1/jobs/:id` (and `/progress`) returns state, progress, timestamps, and error traces.
+  4. **DLQ Control Plane:** `GET /api/v1/dlq/jobs` (paginated audit with poison pill classification), `POST /api/v1/dlq/jobs/:id/retry` (single job replay), and `POST /api/v1/dlq/retry-batch` (Redlock-synchronized batch replay).
+  5. **Health Probing:** `GET /health` pings Redis, returning 503 if broker is degraded.
+* **Alternatives Considered:**
+  - *Direct Broker Access for Microservices:* Exposes Redis port/credentials outside VPC, couples polyglot clients to Node.js/BullMQ drivers.
+  - *Synchronous Blocking Execution over HTTP:* Defeats async decoupling, exhausts API connection pools, and triggers 504 Gateway Timeouts on long jobs.
+  - *In-Memory Idempotency Cache:* Fails across horizontally scaled multi-pod APIs and is lost on process restarts.
+  - *Raw Unhashed Idempotency Keys:* Buggy clients reusing keys across mutated bodies would receive cached results of unrelated jobs (payload poisoning).
+* **Trade-off:** Complete network perimeter isolation and zero duplicate enqueues; adds ~2–5ms HTTP hop latency.
 
-1. **High-Precision Delta Telemetry**:
-   - Instrumented in-worker timestamp tracking using millisecond delta math:
-     $$\Delta t = t_{\text{attempt}_n} - t_{\text{attempt}_{n-1}}$$
-   - Outputs ISO-timestamped markers with explicit attempt indices and measured delay deltas.
+---
 
-2. **Differentiated Test Runners by Operational SLA**:
-   - `verifyNotificationRetries()`: Validates critical OTP exponential backoff ($500\text{ms}$ base, $20\%$ jitter).
-   - `verifyEmailRetries()`: Validates high-priority rate-limited email broadcasts ($2000\text{ms}$ base, $50\%$ jitter).
-   - `verifyImageProcessingRetries()`: Validates CPU-bound fixed backoff ($10000\text{ms}$ base, $30\%$ jitter).
-
-3. **Dynamic Window-Based Assertion Model (`verifyWindows`) vs. Flaky Monotonicity**:
-   - **The Mathematical Jitter Overlap Weakness**: An initial naive assertion required strict monotonic growth (`delays[i] > delays[i-1]`). Under BullMQ's asymmetric exponential jitter formula ($\text{Delay} \in [\text{maxDelay} \cdot (1 - \text{jitter}), \; \text{maxDelay}]$), with $50\%$ jitter on Email ($2000\text{ms}$ base):
-     - Retry #1 bounds: $[1000\text{ms}, \; 2000\text{ms}]$
-     - Retry #2 bounds: $[2000\text{ms}, \; 4000\text{ms}]$
-     Because the upper bound of Retry #1 touches the lower bound of Retry #2 at exactly $2000\text{ms}$, any slight Node.js event-loop lag or Redis polling delay ($> 15\text{ms}$) can cause measured $\Delta t_1 \ge \Delta t_2$, producing intermittent false-negative CI test failures.
-   - **The Window Verification Solution**: Implemented a reusable, parameterized `verifyWindows()` assertion helper that dynamically constructs expected acceptance intervals per retry iteration $i$:
-     $$\text{nominal} = \begin{cases} \text{base} \cdot 2^i & \text{for exponential} \\ \text{base} & \text{for fixed} \end{cases}$$
-     $$\text{window}_i = \big[\, \text{nominal} \cdot (1 - \text{jitter}) - \text{buffer}, \;\; \text{nominal} + \text{buffer} \,\big]$$
-   - Parameterized tolerances ($\text{buffer} = 75\text{ms}$ for low-latency notifications; $300\text{ms}$ for emails and heavy image pipelines) absorb socket latency while strictly asserting that delays remain bounded within their SLA without false negatives.
-
-4. **Dedicated Test Lifecycle & Safe Resource Isolation**:
-   - Uses a dedicated `QueueEvents` listener to await `job.waitUntilFinished(queueEvents)`.
-   - Isolates test workers per test block and closes them before proceeding to the next suite, ensuring zero listener leakage or cross-job contamination.
-   - Gracefully drains and closes the queue, workers, and Redis connection with clean OS exit code `0` (or exits `1` upon SLA violation).
-
-#### Alternatives Considered
-1. **Strict Monotonic Inequality (`delays.every((val, i, arr) => val > arr[i-1])`)**: Rejected because when $\text{jitter} \ge 0.5$, theoretical ranges collide ($2(1 - \text{jitter}) \le 1$), creating non-deterministic, flaky CI test runs under real-world runtime variance.
-2. **Mocking Redis with In-Memory Stubs (`ioredis-mock`)**: Mocking the Redis connection for unit tests. Rejected because `ioredis-mock` does not execute BullMQ's atomic Lua scripts or simulate Redis sorted set delayed queue polling (`bull:<queue>:delayed`), hiding genuine runtime race conditions.
-3. **Manual Log Auditing**: Manually running worker and producer scripts and inspecting timestamps with a stopwatch. Rejected as error-prone, untestable in CI/CD pipelines, and incapable of detecting millisecond jitter boundary regressions.
-4. **Single Monolithic Worker For All Job Types**: Running one worker handling all job types concurrently during retry tests. Rejected because concurrency can cause multiple retrying jobs to interleave, complicating per-job delta measurements and increasing flakiness.
-
-#### Consequences
-* **Positive:**
-  - Automated, deterministic verification proving that BullMQ exponential and fixed backoff configurations perform strictly as specified in ADR-003.
-  - Eliminated test flakiness by shifting from naive monotonic ordering to mathematically sound jitter window boundaries.
-  - Parameterized latency buffer accounts for realistic Redis socket roundtrips without compromising SLA precision.
-  - Zero test leakage or hanging Redis connections upon suite completion.
-* **Negative:**
-  - Full suite runtime requires $\approx 35 - 40\text{s}$ due to waiting for genuine Redis delayed timers (10s image retries and 8s email retries) to expire naturally.
+### ADR-012: In-Memory Throttled Progress Telemetry & On-Demand Polling
+* **Status:** Accepted | **Date:** 2026-10-31
+* **Context:** Divisible jobs (`image-processing`) require progress tracking. Unthrottled calls to `job.updateProgress()` trigger atomic Lua scripts and Pub/Sub broadcasts on every sub-chunk, saturating Redis's single thread and starving BullMQ's heartbeat lock extensions (`extendLock`), triggering false-positive stalled job recoveries.
+* **Decision:** Implemented client-polled progress backed by an in-worker dual-gate rate limiter (`src/throttled-progress.ts`):
+  1. **Dual-Gate In-Memory Rate Limiter:** Enforces `timeElapsed >= 1000ms` and `delta >= 5%`. Drops high-frequency intermediate ticks in worker RAM with zero Redis overhead.
+  2. **Guaranteed Terminal Flush:** Final `tracker.flush(100)` bypasses throttling, guaranteeing Redis reflects strictly 100% completion upon task finish.
+  3. **Selective Instrumentation:** Sub-second atomic jobs (`notification`, `email`) omit progress writes entirely; state transitions (`waiting` $\to$ `active` $\to$ `completed`) suffice.
+  4. **On-Demand Stateless Polling:** `GET /jobs/:id/progress` reads `job.getState()` and `job.progress` on demand, returning `404 Not Found` if pruned by `removeOnComplete`.
+* **Alternatives Considered:**
+  - *In-Memory Event Emitters / Pub/Sub Push:* Fails across OS process boundaries, horizontal multi-pod replicas, and transient HTTP request lifecycles.
+  - *Unthrottled `job.updateProgress()`:* Induces Head-of-Line Redis blocking, delayed lock heartbeats, and duplicate execution loops.
+  - *Database Write on Every Tick:* Saturates relational databases with row-lock contention and excessive write IOPS.
+* **Trade-off:** Quantizes progress telemetry to 1-second intervals in exchange for 75–90% Redis write reduction and zero lock starvation.
 
 ---
 
 ## 4. Failure Modes & Mitigation Matrix
 
-Every distributed system experiences failures. Below is the comprehensive matrix of failure modes analyzed and handled in Qrew:
-
-| Failure Mode | Root Cause / Scenario | Immediate System Behavior | Built-In Mitigation in Qrew | Production Scaling Mitigation |
-| :--- | :--- | :--- | :--- | :--- |
-| **Worker Process Crash Mid-Execution** | Out-Of-Memory (OOM) killer, unhandled segmentation fault, hardware panic | The job was in `active` state; the worker abruptly disconnects without completing. | BullMQ lock token expires after `lockDuration` (30s). Stalled-job checker moves the job back to `prioritized`/`wait` for another worker to pick up. | Ensure all worker tasks are **idempotent** (e.g., check database transaction ID before re-sending charge). |
-| **Downstream Rate Limiting (HTTP 429)** | Email provider or SMS API enforces 100 req/sec quota; burst traffic exceeds limit. | Downstream API returns 429 status code with retry-after header. | **Exponential backoff with 50% randomized jitter** spreads out retries dynamically across non-overlapping intervals, preventing thundering herds. | Implement dynamic concurrency throttler via BullMQ `limiter: { max: 100, duration: 1000 }` or Redis Token Bucket. |
-| **Poison Pill Job** | Malformed input (e.g., invalid email `bad@@user`, corrupted binary image link). | Without validation, job retries 3-5 times, failing each time and wasting time/money. | Schema guard throws **`UnrecoverableError`**, immediately short-circuiting all retry attempts and shunting directly to `failed`. | Automated quarantine queue + alert to webhook/Slack when unrecoverable errors exceed threshold. |
-| **Redis Node Outage / Network Partition** | Primary Redis master crashes, rebooting or promoting replica. | Worker and producer connections drop; in-flight commands fail. | `maxRetriesPerRequest: null` allows `ioredis` to queue commands in memory while continuously reconnecting without crashing Node.js runtime. | Deploy **Redis Sentinel** or **AWS ElastiCache Redis Cluster** with Multi-AZ auto-failover (< 10s switchover). |
-| **Priority Starvation (Monopolization)** | Burst of 100,000 Critical jobs keeps worker 100% saturated; Medium jobs never run. | Medium and High jobs wait in queue indefinitely until Critical queue is drained. | Expected behavior for small-scale single-worker queue; Critical SLA takes absolute priority. | **Multi-Queue Dedicated Worker Pools**: Run dedicated worker pools with weighted ratios (e.g., 4 workers for Critical, 2 for High, 1 for Medium). |
-| **Redis Memory Exhaustion (OOM)** | Queue backlog grows faster than workers consume, or failed jobs accumulate. | Redis refuses writes if configured with `maxmemory-policy noeviction`. | `removeOnComplete: 1000` caps completed job memory; minimal payload footprints (store IDs, not 10MB file buffers). | Redis `maxmemory` alerts in Prometheus; store heavy binary payloads in S3, storing only S3 URIs in job data. |
-
----
-
-## 5. Empirical Load Testing & Verification (550-Job Reverse Benchmark)
-
-To empirically prove that my priority scheduling and FIFO invariants hold under saturation, I designed a comprehensive automated stress test in `src/priority-load-test.ts`.
-
-### Methodology
-1. **Drained and Paused Queue**: The queue was completely paused so no worker could consume jobs prematurely during the ingestion phase.
-2. **Reverse Priority Ingestion**: A total of **550 jobs** were enqueued in strict **reverse priority order**:
-   - **250 Medium Priority (P3)** jobs pushed *first*.
-   - **200 High Priority (P2)** jobs pushed *second*.
-   - **100 Critical Priority (P1)** jobs pushed *last*.
-3. **Chunked Pipeline Insertion**: Jobs were enqueued via `queue.addBulk()` in chunks of 100 to avoid packet size bottlenecking.
-4. **Execution Under Concurrency: 1**: The worker was started with single-threaded concurrency (`concurrency: 1`) to guarantee zero parallel interleaving and strictly observe the queue's internal dequeue sequence.
-5. **Resume & Real-Time Tracking**: The queue was resumed, and an execution journal tracked the exact timestamp and sequence ID of every completed job.
-
-### Verification Results
-* **Total Execution Time:** 550 jobs completed in ~500ms (~1,100 jobs/sec throughput).
-* **Global Priority Invariant:** **PASSED** (Strictly 100 Critical $\rightarrow$ 200 High $\rightarrow$ 250 Medium). Every single Critical job ran before any High job, and every High job ran before any Medium job, despite Critical jobs being enqueued dead last.
-* **Intra-Priority FIFO Invariant:** **PASSED**. Within each priority cohort (P1, P2, P3), tasks executed in the exact order of their initial insertion sequence (`seq` counter strictly monotonically increasing).
+| Failure Mode | Immediate Behavior | Built-In Mitigation | Production Scaling Mitigation |
+| :--- | :--- | :--- | :--- |
+| **Worker Crash Mid-Job** | Job left in `active` state. | BullMQ lock expires; stalled monitor returns job to queue. | Ensure worker tasks are idempotent at DB level. |
+| **Downstream Rate Limit (429)** | Provider returns 429. | Exponential backoff + 50% randomized jitter prevents thundering herd. | In-worker rate limiter (`limiter: { max, duration }`). |
+| **Poison Pill Job** | Malformed input. | Schema guard throws `PoisonPillError`, short-circuiting to `failed`. | Automated quarantine alerts to Slack/PagerDuty. |
+| **Redis Outage / Partition** | Broker socket drops. | `maxRetriesPerRequest: null` queues commands; reconnects automatically. | Redis Sentinel or AWS ElastiCache Multi-AZ failover. |
+| **Priority Starvation** | P1 flood blocks P3. | Inherent to strict single-queue priority. | Multi-Queue worker pools (dedicated P1, P2, P3 workers). |
+| **Redis Memory Pressure** | Backlog grows. | `removeOnComplete: 1000`, `removeOnFail: 1000`, `noeviction` policy. | S3 external payload storage; Redis memory alerts. |
+| **Infinite Replay Loop** | Persistent failure retried. | `maxReplays: 3` ceiling permanently flags job as poison pill. | Dead-letter forwarding to BigQuery/Elasticsearch. |
+| **Concurrent Replay Race** | Multiple admins replay DLQ. | Redlock (`lock:replay:<queue>`) serializes replay execution. | OpenTelemetry distributed tracing span correlation. |
+| **Network Retry Submission** | Duplicate HTTP POST. | Ingress Idempotency Manager caches response; returns duplicate 202. | 24-hour Redis idempotency lease TTL. |
+| **Idempotency Key Mutation** | Same key, altered body. | Canonical SHA-256 fingerprint mismatch returns `422 Unprocessable Entity`. | Enforce unique UUIDv4 headers on client SDKs. |
+| **Broker Down on Ingestion** | Enqueue fails. | Returns `503 Service Unavailable`, deletes lease for immediate retry. | Circuit breaker + Transactional Outbox in SQL. |
+| **Progress Write Saturation** | High-frequency progress updates flood Redis. | In-memory dual-gate throttler (`1000ms`, `5%`) caps writes; terminal `flush()` ensures 100% completion. | Offload high-frequency chunk telemetry to Redis Streams or separate ephemeral cache cluster. |
 
 ---
 
-## 6. Scaling Roadmaps: What I Would Do Differently at 100x Scale
+## 5. Load Testing & Invariant Verification
 
-While Qrew's current architecture handles thousands of jobs per second with sub-millisecond dispatch times, operating at **100,000+ QPS** across large distributed engineering organizations introduces new architectural bottlenecks:
+Empirically validated via `src/priority-load-test.ts` (550 jobs enqueued in reverse order: 250 Medium, 200 High, 100 Critical):
+- **Global Priority Invariant:** **PASSED**. 100 Critical jobs completed first, followed by 200 High, followed by 250 Medium.
+- **Intra-Priority FIFO Invariant:** **PASSED**. Within each priority level, jobs executed in strict insertion order (`seq` monotonically increasing).
+- **Throughput:** ~1,100 jobs/sec on a single worker core under saturation.
+- **Throttled Progress Invariant (`src/verify-progress.ts`):** **PASSED**. Multi-chunk task executed 20 progress iterations; throttler eliminated ~75% of redundant writes to Redis while terminal `flush(100)` guaranteed exact completion state on API read.
 
-```
-[Scale Evolution: From Monolithic Queue to Partitioned Sharded Architecture]
+---
 
-CURRENT ARCHITECTURE (1 Node Redis, Single Queue):
-  Producer ---> [ my-queue (ZSET) ] ---> Worker (Concurrency: 1)
+## 6. Scaling Roadmap (100x Scale)
 
-100X SCALE ARCHITECTURE:
-  API Gateways
-       |
-       +---> [ Dedicated Critical Queue ] ---> [ Auto-scaled K8s Pods (SLA: <50ms) ]
-       +---> [ Dedicated High Queue ]     ---> [ Auto-scaled K8s Pods (SLA: <2s) ]
-       +---> [ Dedicated Medium Queue ]   ---> [ Spot Instance Pods (SLA: <5m) ]
-       |
-  Shared Redis Cluster / Key-partitioned across Shards
-       |
-  Out-of-Process Isolation (libvips C++ threadpool for images)
-       |
-  Kafka / CDC Pipeline for Dead-Letter Analysis & BigQuery Archival
-```
-
-### 1. Dedicated Queues per Priority (Eliminating Starvation)
-- **Current Limitation:** A shared queue with strict priority can starve low-priority tasks during sustained traffic spikes.
-- **Production Solution:** Split into three physical Redis queues: `queue:critical`, `queue:high`, and `queue:medium`. Allocate dedicated worker pools to each queue (e.g., 60% compute to critical, 30% to high, 10% to medium). Critical jobs never wait on medium workers, and medium jobs are never starved completely.
-
-### 2. Idempotency Keys & Deduplication Windows
-- **Current Limitation:** If a network blip occurs after worker execution but before the completion ack reaches Redis, the stalled job monitor will re-run the job, potentially causing duplicate SMS or duplicate credit card charges.
-- **Production Solution:** Enforce an `idempotencyKey` on job options:
-  ```typescript
-  await queue.add('charge-card', payload, {
-      jobId: `idemp_${userId}_${transactionId}` // BullMQ natively rejects duplicate active IDs
-  });
-  ```
-  Workers store an atomic execution claim in the primary database with a unique transaction constraint before triggering external side-effects.
-
-### 3. Out-of-Process Worker Sandboxing (Heavy CPU Isolation)
-- **Current Limitation:** In my current worker, image processing runs inside the Node.js event loop. CPU-heavy operations (e.g., Sharp/libvips image transformations or PDF generation) block the single-threaded event loop, delaying the processing of lightweight OTP notifications.
-- **Production Solution:** Utilize BullMQ's **Sandboxed Process Workers** (`worker.ts` pointed to a separate process file) or spin up isolated microservices written in Go or Rust specifically for compute-intensive transformations.
-
-### 4. Dynamic Auto-Scaling with KEDA (Kubernetes Event-driven Autoscaling)
-- **Current Limitation:** Static worker concurrency defined in configuration files.
-- **Production Solution:** Deploy workers on Kubernetes and configure KEDA to monitor Redis queue depth (`bull:my-queue:prioritized` cardinality). Automatically scale worker pods from 2 to 50 during peak hours and scale down during quiet hours.
-
-### 5. Telemetry, Tracing & Operational Observability
-- **Production Solution:**
-  - Inject OpenTelemetry `traceparent` headers into the job `data` payload at enqueue time. The worker extracts the context to provide continuous distributed tracing across API -> Queue -> Worker -> External APIs.
-  - Mount **Bull-Board** (dashboard) secured behind internal SSO for real-time visual inspection of queue metrics, active locks, and dead-letter queues.
-  - Export Prometheus metrics: `queue_latency_seconds`, `jobs_completed_total`, `jobs_failed_total`, `queue_depth_gauge`.
+1. **Dedicated Priority Queues:** Split `my-queue` into `queue:critical`, `queue:high`, and `queue:medium` with weighted worker allocation (e.g., 60% / 30% / 10%) to prevent starvation.
+2. **KEDA Dynamic Autoscaling:** Scale Kubernetes worker pods dynamically from 2 to 50 based on Redis queue depth (`bull:my-queue:prioritized` cardinality).
+3. **Out-of-Process CPU Sandboxing:** Move heavy image transformations to BullMQ Sandboxed child processes with isolated Libuv threadpools (`UV_THREADPOOL_SIZE >= 8`).
+4. **Transactional Outbox & CDC:** Store jobs in an ACID database `outbox` table during Redis network outages, relaying asynchronously once broker reconnects.
+5. **OpenTelemetry Propagation:** Inject W3C `traceparent` headers at HTTP ingress, tracing execution seamlessly across API $\to$ Redis $\to$ Worker $\to$ External APIs.
