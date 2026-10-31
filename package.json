@@ -12,7 +12,9 @@
     "test:priority": "tsx src/priority-load-test.ts",
     "test:retry": "tsx src/verify-retries.ts",
     "test:progress": "tsx src/verify-progress.ts",
-    "test:dlq": "tsx src/verify-dlq-replay.ts"
+    "test:dlq": "tsx src/verify-dlq-replay.ts",
+    "test:api": "tsx src/verify-api-endpoints.ts",
+    "api:start": "tsx src/api-server.ts"
   },
   "repository": {
     "type": "git",
