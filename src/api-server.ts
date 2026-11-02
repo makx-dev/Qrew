@@ -5,6 +5,8 @@ import { redisConnection } from './redis-connection';
 import { IdempotencyManager } from './idempotency';
 import { isPoisonPill } from './errors';
 import { inspectAndReplayFailedJobs } from './replay-service';
+import { createMultiRoleBullBoards, enforceReadOnlyMethods } from './monitoring-board';
+import { requireUserAuth, requireAdminAuth } from './monitoring-auth';
 import {
     JobPriority,
     NotificationPayload,
@@ -18,6 +20,17 @@ app.use(express.json());
 // Main default queue instance
 export const queue = new Queue('my-queue', { connection: redisConnection });
 const idempotency = new IdempotencyManager(redisConnection);
+
+// Setup multi-role Bull Board instances (Admin vs User Read-Only)
+export const { adminRouter, userRouter } = createMultiRoleBullBoards({
+    queues: [queue],
+});
+
+// Mount User Read-Only Dashboard (Strict user auth + read-only HTTP method guard)
+app.use('/user/queues', requireUserAuth, enforceReadOnlyMethods, userRouter);
+
+// Mount Admin Interactive Dashboard (Strict admin auth + full mutation controls)
+app.use('/admin/queues', requireAdminAuth, adminRouter);
 
 /**
  * Health check endpoint: verifies Redis connection readiness
@@ -343,6 +356,52 @@ async function handleBatchRetry(req: Request, res: Response) {
 
 app.post('/api/v1/dlq/retry-batch', handleBatchRetry);
 app.post('/api/v1/queues/:queueName/dlq/retry-batch', handleBatchRetry);
+
+// 5. QUEUE METRICS & DEPTH TELEMETRY
+async function handleGetQueueMetrics(_req: Request, res: Response) {
+    try {
+        if (redisConnection.status !== 'ready') {
+            return res.status(503).json({
+                error: 'Service Unavailable',
+                message: 'Queue broker is offline or reconnecting.',
+            });
+        }
+
+        const counts = await queue.getJobCounts(
+            'waiting',
+            'active',
+            'completed',
+            'failed',
+            'delayed',
+            'paused'
+        );
+
+        const queueDepth = (counts.waiting || 0) + (counts.delayed || 0);
+
+        return res.json({
+            queue: queue.name,
+            timestamp: new Date().toISOString(),
+            queueDepth,
+            metrics: {
+                active: counts.active || 0,
+                waiting: counts.waiting || 0,
+                delayed: counts.delayed || 0,
+                failed: counts.failed || 0,
+                completed: counts.completed || 0,
+                paused: counts.paused || 0,
+            },
+        });
+    } catch (error: any) {
+        return res.status(500).json({
+            error: 'Internal Server Error',
+            message: 'Failed to retrieve queue metrics',
+            details: error.message,
+        });
+    }
+}
+
+app.get('/api/v1/metrics', handleGetQueueMetrics);
+app.get('/api/v1/queues/:queueName/metrics', handleGetQueueMetrics);
 
 // Global unhandled error handler
 app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
