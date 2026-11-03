@@ -12,6 +12,7 @@ import {
     NotificationPayload,
     EmailPayload,
     ImageProcessingPayload,
+    ClickSyncPayload,
 } from './JobTypes';
 
 export const app = express();
@@ -79,6 +80,13 @@ function validateJobPayload(type: string, data: any): { valid: boolean; error?: 
             const p = data as ImageProcessingPayload;
             if (!p.imageUrl || !p.dimensions?.width || !p.dimensions?.height || !['jpg', 'png', 'webp'].includes(p.format)) {
                 return { valid: false, error: 'Invalid image-processing data: "imageUrl", "dimensions" (width, height), and format ("jpg" | "png" | "webp") are required.' };
+            }
+            break;
+        }
+        case 'click-sync': {
+            const p = data as ClickSyncPayload;
+            if (p.batchSize !== undefined && (typeof p.batchSize !== 'number' || p.batchSize <= 0)) {
+                return { valid: false, error: 'Invalid click-sync data: batchSize must be a positive integer.' };
             }
             break;
         }
@@ -373,7 +381,7 @@ async function handleGetQueueMetrics(_req: Request, res: Response) {
             'completed',
             'failed',
             'delayed',
-            'paused'
+            'prioritized'
         );
 
         const queueDepth = (counts.waiting || 0) + (counts.delayed || 0);

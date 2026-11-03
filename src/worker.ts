@@ -1,8 +1,9 @@
 import { Worker, Job } from 'bullmq';
 import { redisConnection } from './redis-connection';
-import { NotificationPayload, EmailPayload, ImageProcessingPayload } from './JobTypes';
+import { NotificationPayload, EmailPayload, ImageProcessingPayload, ClickSyncPayload } from './JobTypes';
 import { ThrottledProgress } from './throttled-progress';
 import { PoisonPillError, isPoisonPill } from './errors';
+import { pgPool } from './db';
 
 function isValidEmail(email: string): boolean {
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -72,6 +73,49 @@ export const worker = new Worker(
                 return { processed: true };
             }
 
+            case 'click-sync': {
+                const data = (job.data as ClickSyncPayload) || {};
+                const batchLimit = data.batchSize || 100;
+
+                // 1. Pop dirty codes from Redis dirty set
+                const rawDirty = await redisConnection.spop('dirty:clicks', batchLimit);
+                const codes = Array.isArray(rawDirty) ? rawDirty : rawDirty ? [rawDirty] : [];
+
+                if (codes.length === 0) {
+                    console.log(`[CLICK-SYNC] No dirty click keys to synchronize.`);
+                    return { syncedCodes: 0, totalClicks: 0 };
+                }
+
+                let syncedCodes = 0;
+                let totalClicks = 0;
+
+                for (const code of codes) {
+                    // Atomic GETDEL ensures clicks accumulating after this point start a fresh counter
+                    const clicksStr = await redisConnection.getdel(`clicks:${code}`);
+                    const clicks = Number(clicksStr) || 0;
+
+                    if (clicks > 0) {
+                        try {
+                            await pgPool.query(
+                                'UPDATE urls SET click_cnt = click_cnt + $1 WHERE short_code = $2',
+                                [clicks, code]
+                            );
+                            totalClicks += clicks;
+                            syncedCodes++;
+                        } catch (dbErr: any) {
+                            console.error(`[CLICK-SYNC ERROR] Failed updating DB for code ${code}:`, dbErr.message);
+                            // Restore counts in Redis so no clicks are lost
+                            await redisConnection.incrby(`clicks:${code}`, clicks);
+                            await redisConnection.sadd('dirty:clicks', code);
+                            throw dbErr; // Let BullMQ retry/backoff handle transient errors
+                        }
+                    }
+                }
+
+                console.log(`[DONE] [CLICK-SYNC] Synced ${totalClicks} clicks across ${syncedCodes} URLs`);
+                return { syncedCodes, totalClicks };
+            }
+
             default:
                 throw new Error(`Unknown job type: ${job.name}`);
         }
@@ -108,4 +152,5 @@ worker.on('failed', (job: Job | undefined, err: Error) => {
 export async function shutdownWorker() {
     console.log('Shutting down worker...');
     await worker.close();
+    await pgPool.end();
 }
