@@ -1,11 +1,10 @@
-version: '3.8'
-
 services:
   redis:
     image: redis:7-alpine
     container_name: qrew-redis
     ports:
-      - "6379:6379"
+      - "6380:6379"
+    restart: unless-stopped
 
   postgres:
     image: postgres:15-alpine
@@ -15,7 +14,8 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: password
     ports:
-      - "5432:5432"
+      - "5433:5432"
+    restart: unless-stopped
 
   app:
     build: .
@@ -27,6 +27,10 @@ services:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - DATABASE_URL=postgresql://postgres:password@postgres:5432/url_shortener
+      - USER_DASHBOARD_PASSWORD=demo_viewer_pass
+      - ADMIN_DASHBOARD_PASSWORD=demo_admin_pass
+      - PORT=3000
     depends_on:
       - redis
       - postgres
+    restart: unless-stopped
