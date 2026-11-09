@@ -34,6 +34,171 @@ app.use('/user/queues', requireUserAuth, enforceReadOnlyMethods, userRouter);
 app.use('/admin/queues', requireAdminAuth, adminRouter);
 
 /**
+ * Root Portfolio Landing Page & Interactive Dispatcher Console
+ */
+app.get('/', (_req: Request, res: Response) => {
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Qrew — Distributed Job Queue Engine</title>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --card-bg: #161b22;
+      --border: #30363d;
+      --text: #c9d1d9;
+      --text-muted: #8b949e;
+      --accent: #58a6ff;
+      --success: #3fb950;
+      --warning: #d29922;
+      --danger: #f85149;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+    body { background-color: var(--bg); color: var(--text); padding: 24px 16px; line-height: 1.5; }
+    .container { max-width: 1000px; margin: 0 auto; }
+    header { border-bottom: 1px solid var(--border); padding-bottom: 20px; margin-bottom: 24px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 16px; }
+    h1 { font-size: 24px; color: #fff; font-weight: 700; display: flex; align-items: center; gap: 10px; }
+    .badge { font-size: 12px; padding: 4px 10px; border-radius: 12px; font-weight: 600; text-transform: uppercase; background: #238636; color: #fff; }
+    .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; margin-bottom: 24px; }
+    .stat-card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 8px; padding: 14px; text-align: center; }
+    .stat-val { font-size: 24px; font-weight: 700; color: #fff; }
+    .stat-lbl { font-size: 12px; color: var(--text-muted); text-transform: uppercase; margin-top: 4px; }
+    .section-title { font-size: 16px; font-weight: 600; color: #fff; margin-bottom: 12px; display: flex; align-items: center; gap: 8px; }
+    .card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 8px; padding: 20px; margin-bottom: 24px; }
+    .actions-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
+    button { background: #21262d; border: 1px solid var(--border); color: #fff; padding: 12px 14px; border-radius: 6px; font-weight: 600; cursor: pointer; transition: all 0.2s; text-align: left; }
+    button:hover { background: #30363d; border-color: var(--accent); }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn-desc { display: block; font-size: 11px; font-weight: normal; color: var(--text-muted); margin-top: 4px; }
+    .dash-links { display: flex; gap: 12px; flex-wrap: wrap; }
+    .dash-btn { flex: 1; min-width: 220px; background: #21262d; border: 1px solid var(--border); border-radius: 6px; padding: 14px; text-decoration: none; color: #fff; display: block; }
+    .dash-btn:hover { border-color: var(--accent); background: #30363d; }
+    .dash-btn strong { display: block; font-size: 14px; color: var(--accent); }
+    .dash-btn span { display: block; font-size: 12px; color: var(--text-muted); margin-top: 4px; }
+    .creds { display: inline-block; background: #000; padding: 2px 6px; border-radius: 4px; font-family: monospace; color: var(--warning); margin-top: 4px; font-size: 11px; }
+    pre { background: #000; border: 1px solid var(--border); border-radius: 6px; padding: 14px; color: #7ee787; font-family: Consolas, monospace; font-size: 12px; overflow-x: auto; max-height: 240px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div>
+        <h1>⚡ Qrew Engine <span class="badge" id="broker-status">Checking...</span></h1>
+        <p style="font-size: 13px; color: var(--text-muted); margin-top: 4px;">
+          Distributed BullMQ Queue &bull; Redis Broker &bull; Neon Postgres &bull; Express RBAC
+        </p>
+      </div>
+      <div>
+        <a href="/health" target="_blank" style="color: var(--accent); text-decoration: none; font-size: 13px;">/health</a> &bull;
+        <a href="/api/v1/metrics" target="_blank" style="color: var(--accent); text-decoration: none; font-size: 13px;">/api/v1/metrics</a>
+      </div>
+    </header>
+
+    <div class="stats-grid">
+      <div class="stat-card"><div class="stat-val" id="stat-active">-</div><div class="stat-lbl">Active</div></div>
+      <div class="stat-card"><div class="stat-val" id="stat-waiting">-</div><div class="stat-lbl">Waiting</div></div>
+      <div class="stat-card"><div class="stat-val" id="stat-completed" style="color: var(--success);">-</div><div class="stat-lbl">Completed</div></div>
+      <div class="stat-card"><div class="stat-val" id="stat-failed" style="color: var(--danger);">-</div><div class="stat-lbl">Failed (DLQ)</div></div>
+      <div class="stat-card"><div class="stat-val" id="stat-delayed">-</div><div class="stat-lbl">Delayed</div></div>
+    </div>
+
+    <div class="card">
+      <div class="section-title">📊 Live Monitoring Dashboards</div>
+      <div class="dash-links">
+        <a class="dash-btn" href="/user/queues" target="_blank">
+          <strong>User Dashboard (Read-Only)</strong>
+          <span>Observer view for queues & telemetry</span>
+          <span class="creds">User: viewer &bull; Pass: demo_viewer_pass</span>
+        </a>
+        <a class="dash-btn" href="/admin/queues" target="_blank">
+          <strong>Admin Console (Mutating)</strong>
+          <span>Full queue mutation & DLQ replay</span>
+          <span class="creds">User: admin &bull; Pass: demo_admin_pass</span>
+        </a>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="section-title">🚀 Interactive Job Dispatcher (1-Click Test Bench)</div>
+      <div class="actions-grid">
+        <button onclick="dispatch('notification', { userId: 'usr_77', message: 'Your OTP is 849201', channel: 'sms' }, 1)">
+          ⚡ Push P1 Critical Job
+          <span class="btn-desc">Priority 1 &bull; Fast recovery &bull; OTP/SMS</span>
+        </button>
+        <button onclick="dispatch('email', { to: 'recruiter@example.com', subject: 'Welcome to Qrew', body: 'Test asynchronous batch email' }, 2)">
+          📧 Push P2 Email Job
+          <span class="btn-desc">Priority 2 &bull; Tiered jitter backoff</span>
+        </button>
+        <button onclick="dispatch('image-processing', { imageUrl: 'https://example.com/banner.png', dimensions: { width: 1920, height: 1080 }, format: 'webp' }, 3)">
+          🖼️ Push P3 Heavy Job
+          <span class="btn-desc">Priority 3 &bull; Throttled dual-gate progress</span>
+        </button>
+        <button onclick="dispatch('notification', { userId: 'usr_fail', message: 'FAIL_SIMULATION', channel: 'sms' }, 2)">
+          💥 Trigger Poison Pill
+          <span class="btn-desc">UnrecoverableError &bull; DLQ Quarantine</span>
+        </button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="section-title">📟 Live Execution Terminal</div>
+      <pre id="console-log">// Click any button above to enqueue a real job into the Redis broker.
+// Metrics and queue states will update automatically.</pre>
+    </div>
+  </div>
+
+  <script>
+    const logEl = document.getElementById('console-log');
+    function log(msg) {
+      const ts = new Date().toLocaleTimeString();
+      logEl.textContent = "[" + ts + "] " + msg + "\\n" + logEl.textContent;
+    }
+
+    async function fetchMetrics() {
+      try {
+        const res = await fetch('/api/v1/metrics');
+        if (!res.ok) throw new Error('Status ' + res.status);
+        const data = await res.json();
+        document.getElementById('broker-status').textContent = 'Online';
+        document.getElementById('broker-status').style.background = '#238636';
+        document.getElementById('stat-active').textContent = data.metrics.active;
+        document.getElementById('stat-waiting').textContent = data.metrics.waiting;
+        document.getElementById('stat-completed').textContent = data.metrics.completed;
+        document.getElementById('stat-failed').textContent = data.metrics.failed;
+        document.getElementById('stat-delayed').textContent = data.metrics.delayed;
+      } catch (err) {
+        document.getElementById('broker-status').textContent = 'Offline';
+        document.getElementById('broker-status').style.background = '#da3633';
+      }
+    }
+
+    async function dispatch(type, payload, priority) {
+      log("Dispatching " + type + " (Priority " + priority + ")...");
+      try {
+        const res = await fetch('/api/v1/jobs', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ type, data: payload, priority })
+        });
+        const json = await res.json();
+        log("Enqueued -> Job ID: " + json.jobId + " (Status: " + json.status + ")");
+        setTimeout(fetchMetrics, 1000);
+      } catch (err) {
+        log("Error enqueuing job: " + err.message);
+      }
+    }
+
+    fetchMetrics();
+    setInterval(fetchMetrics, 3000);
+  </script>
+</body>
+</html>`);
+});
+
+/**
  * Health check endpoint: verifies Redis connection readiness
  */
 app.get('/health', async (_req: Request, res: Response) => {
