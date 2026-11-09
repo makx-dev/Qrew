@@ -136,7 +136,7 @@ app.get('/', (_req: Request, res: Response) => {
           🖼️ Push P3 Heavy Job
           <span class="btn-desc">Priority 3 &bull; Throttled dual-gate progress</span>
         </button>
-        <button onclick="dispatch('notification', { userId: 'usr_fail', message: 'FAIL_SIMULATION', channel: 'sms' }, 2)">
+        <button onclick="dispatch('email', { to: 'invalid-email-address', subject: 'Simulated Poison Pill', body: 'Payload deliberately triggers PoisonPillError' }, 2)">
           💥 Trigger Poison Pill
           <span class="btn-desc">UnrecoverableError &bull; DLQ Quarantine</span>
         </button>
@@ -549,7 +549,8 @@ async function handleGetQueueMetrics(_req: Request, res: Response) {
             'prioritized'
         );
 
-        const queueDepth = (counts.waiting || 0) + (counts.delayed || 0);
+        const totalWaiting = (counts.waiting || 0) + (counts.prioritized || 0);
+        const queueDepth = totalWaiting + (counts.delayed || 0);
 
         return res.json({
             queue: queue.name,
@@ -557,7 +558,7 @@ async function handleGetQueueMetrics(_req: Request, res: Response) {
             queueDepth,
             metrics: {
                 active: counts.active || 0,
-                waiting: counts.waiting || 0,
+                waiting: totalWaiting,
                 delayed: counts.delayed || 0,
                 failed: counts.failed || 0,
                 completed: counts.completed || 0,
