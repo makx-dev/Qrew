@@ -16,7 +16,8 @@
     "test:api": "tsx src/verify-api-endpoints.ts",
     "test:monitoring": "tsx src/verify-monitoring.ts",
     "test:cachecut": "tsx src/verify-cachecut-sync.ts",
-    "api:start": "tsx src/api-server.ts"
+    "api:start": "tsx src/api-server.ts",
+    "start": "node dist/server.js"
   },
   "repository": {
     "type": "git",
@@ -33,6 +34,8 @@
   "dependencies": {
     "@bull-board/api": "^9.11.0",
     "@bull-board/express": "^9.11.0",
+    "@neon/config": "^1.13.0",
+    "@neon/env": "^2.1.0",
     "bullmq": "^6.3.17",
     "dotenv": "^18.0.8",
     "express": "^5.3.0",
