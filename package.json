@@ -2,7 +2,7 @@
   "name": "qrew",
   "version": "1.0.0",
   "description": "",
-  "main": "index.js",
+  "main": "dist/server.js",
   "scripts": {
     "build": "tsc",
     "worker:dev": "tsx src/worker-runner.ts",
