@@ -2,6 +2,24 @@
 
 A production-oriented distributed asynchronous job queue engine built with **TypeScript, BullMQ, Redis and Express**.
 
+[![Live Demo](https://img.shields.io/badge/Live_Demo-Interactive_Console-2ea44f?style=for-the-badge&logo=render)](https://qrew.onrender.com)
+[![Bull Board](https://img.shields.io/badge/Bull_Board-Live_Dashboard-blue?style=for-the-badge&logo=redis)](https://qrew.onrender.com/user/queues)
+[![Docker](https://img.shields.io/badge/Docker-Compose_Ready-2496ED?style=for-the-badge&logo=docker)](./docker-compose.yml)
+
+> ⏳ *Note: First load may take 30–60s while the Render free-tier instance wakes up.*
+
+### 🌐 Live Portfolio Links
+- **Interactive Sandbox & Dispatcher**: [https://qrew.onrender.com](https://qrew.onrender.com)
+- **Viewer Dashboard (Read-Only)**: [https://qrew.onrender.com/user/queues](https://qrew.onrender.com/user/queues)
+- **Admin Console (Mutating & DLQ Replay)**: [https://qrew.onrender.com/admin/queues](https://qrew.onrender.com/admin/queues)
+- **Broker Health Endpoint**: [https://qrew.onrender.com/health](https://qrew.onrender.com/health)
+
+**Demo Credentials (HTTP Basic Auth):**
+- **Viewer**: `viewer` / `demo_viewer_pass`
+- **Admin**: `admin` / `demo_admin_pass`
+
+---
+
 Qrew decouples synchronous API traffic from compute-intensive or rate-limited work such as transactional OTPs, bulk emails, image processing and database write-behind syncs. It ships with strict priority scheduling, tiered retries with jitter, poison-pill isolation, SHA-256 idempotency at the ingress layer, throttled progress telemetry, a native dead-letter queue with Redlock-protected replay, role-partitioned Bull Board dashboards, and a documented failure-mode matrix.
 
 Its first production workload is the click-persistence pipeline of [CacheCut](https://github.com/makx-dev/CacheCut), a high-throughput URL shortener.
