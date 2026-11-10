@@ -25,6 +25,7 @@
    - [ADR-012: In-Memory Throttled Progress Telemetry & On-Demand Polling](#adr-012-in-memory-throttled-progress-telemetry--on-demand-polling)
    - [ADR-013: Multi-Role Observability, Bull Board UI Partitioning & Fail-Safe RBAC](#adr-013-multi-role-observability-bull-board-ui-partitioning--fail-safe-rbac)
    - [ADR-014: Decoupled CacheCut Click-Sync Consumer Engine & Scheduler Pruning](#adr-014-decoupled-cachecut-click-sync-consumer-engine--scheduler-pruning)
+   - [ADR-015: Capped Job Retention, Redis Memory Bounds & Production Metrics Decoupling](#adr-015-capped-job-retention-redis-memory-bounds--production-metrics-decoupling)
 4. [Failure Modes & Mitigation Matrix](#4-failure-modes--mitigation-matrix)
 5. [Load Testing & Invariant Verification](#5-load-testing--invariant-verification)
 6. [Scaling Roadmap (100x Scale)](#6-scaling-roadmap-100x-scale)
@@ -300,6 +301,22 @@ Qrew decouples synchronous API interactions from compute-intensive and rate-limi
   - *In-Process CacheCut `setInterval`:* Contends for PostgreSQL connection pools and steals event-loop cycles from the redirect path.
   - *HTTP API Push Ingress on Every Flush:* Introduces outbound network socket latency and failure modes into CacheCut.
 * **Trade-off:** Introduces a bounded 5-second eventual consistency window for PostgreSQL analytics in exchange for total redirect isolation, serialized execution, and guaranteed zero click loss.
+
+---
+
+### ADR-015: Capped Job Retention, Redis Memory Bounds & Production Metrics Decoupling
+* **Status:** Accepted | **Date:** 2026-11-10
+* **Context:** In asynchronous queue systems with high-frequency recurring jobs (such as CacheCut's click-sync scheduler executing every 10 seconds), 8,640 jobs run every 24 hours. Storing completed job metadata, payloads, and return values indefinitely in Redis monotonically consumes RAM, rapidly exceeding the strict 30MB memory ceiling of free-tier cloud Redis (Redis Cloud / Upstash) and triggering out-of-memory (`OOM`) or `noeviction` crashes.
+* **Decision:**
+  1. **Enforce Circular Buffer Eviction (`removeOnComplete: 100`):** Configured repeatable background jobs with a strict ceiling (`removeOnComplete: 100`, with one-off API jobs capped at 1,000). BullMQ automatically purges the oldest completed job hash once the threshold is exceeded, bounding Redis memory footprint to a predictable, fixed upper limit (~2–5MB).
+  2. **Expose Retained Count in UI & Telemetry:** Explicitly label the dashboard metric as `"Completed (last 100 retained)"` with contextual tooltip documentation so operators understand that the count reflects the active ring-buffer depth rather than an unbounded lifetime total.
+* **Trade-off:**
+  - *Trade-off:* Redis no longer serves as an archival database of all lifetime completed jobs. The BullMQ completed count tops out at 100 once the circular buffer saturates.
+* **Production Strategy (Decoupled Lifetime Metrics):**
+  In enterprise production environments, Redis is strictly a transient message broker, not an analytical data warehouse. Lifetime metrics should be decoupled via:
+  1. **External Time-Series / Prometheus Counters:** Export an atomic counter `qrew_jobs_completed_total{queue="my-queue", type="click-sync"}` incremented on the `completed` event via Prometheus client / OpenTelemetry.
+  2. **Persistent Relational DB Metrics Table:** Asynchronously increment daily summary counters in PostgreSQL (`UPDATE queue_daily_stats SET completed_count = completed_count + 1 WHERE date = CURRENT_DATE`).
+  3. **Lightweight Redis Counter Key:** Maintain a decoupled Redis integer counter (`INCR qrew:stats:lifetime_completed`) that stores an 8-byte integer without retaining heavyweight job hashes or payloads.
 
 ---
 

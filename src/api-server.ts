@@ -440,12 +440,15 @@ app.get('/', (_req: Request, res: Response) => {
         </div>
         <div class="stat-val" id="stat-waiting">-</div>
       </div>
-      <div class="stat-card">
+      <div class="stat-card" title="Older jobs evicted via removeOnComplete: 100.">
         <div class="stat-header">
-          <span class="stat-lbl">Completed</span>
+          <span class="stat-lbl">Completed <span style="font-size: 10px; color: var(--text-dim); font-weight: normal; text-transform: none;">(last 100 retained)</span></span>
           <i data-lucide="check-circle-2" class="stat-icon" style="width: 16px; height: 16px;"></i>
         </div>
         <div class="stat-val success" id="stat-completed">-</div>
+        <div style="font-size: 10.5px; color: var(--text-dim); margin-top: 4px; line-height: 1.2;">
+          Older jobs evicted via removeOnComplete: 100
+        </div>
       </div>
       <div class="stat-card">
         <div class="stat-header">

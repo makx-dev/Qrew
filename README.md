@@ -49,6 +49,7 @@ Its first production workload is the click-persistence pipeline of [CacheCut](ht
 - **Multi-role Bull Board dashboards**: a read-only user view and a full-control admin view, behind default-deny RBAC.
 - **Health and metrics endpoints** that probe broker readiness and expose O(1) queue counts.
 - **Native recurring scheduler** (BullMQ v6 `upsertJobScheduler`) used for CacheCut click-sync.
+- **Bounded memory via circular retention**: Completed jobs are ring-buffered (`removeOnComplete: 100`) to strictly protect Redis RAM, decoupling transient broker storage from lifetime metrics (see [ADR-015](./ADR.md#adr-015-capped-job-retention-redis-memory-bounds--production-metrics-decoupling)).
 - **Empirical verification harnesses** for priority, retries, progress, DLQ, API contracts, monitoring auth and click-sync.
 
 ---
