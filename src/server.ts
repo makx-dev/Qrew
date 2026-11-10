@@ -18,9 +18,28 @@ setupClickSyncScheduler(queue, 10000).catch((err) => {
     console.warn('[Qrew] Click-sync scheduler notice:', err.message);
 });
 
+// 4. Ensure queue is active on boot (resets any residual pause state in Redis)
+queue.resume().catch((err) => {
+    console.warn('[Qrew] Startup resume notice:', err.message);
+});
+
+// 5. Watchdog: Auto-resume queue every 60s if a demo visitor paused it
+const watchdog = setInterval(async () => {
+    try {
+        if (await queue.isPaused()) {
+            console.log('[WATCHDOG] Queue was paused. Auto-resuming for public demo availability...');
+            await queue.resume();
+        }
+    } catch (err: any) {
+        console.warn('[WATCHDOG] Check failed:', err.message);
+    }
+}, 60000);
+watchdog.unref();
+
 // Graceful shutdown handling
 const handleShutdown = async () => {
     console.log('[Qrew] Graceful shutdown initiated...');
+    clearInterval(watchdog);
     server.close();
     await shutdownWorker();
     await queueEvents.close();

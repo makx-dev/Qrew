@@ -26,6 +26,7 @@
    - [ADR-013: Multi-Role Observability, Bull Board UI Partitioning & Fail-Safe RBAC](#adr-013-multi-role-observability-bull-board-ui-partitioning--fail-safe-rbac)
    - [ADR-014: Decoupled CacheCut Click-Sync Consumer Engine & Scheduler Pruning](#adr-014-decoupled-cachecut-click-sync-consumer-engine--scheduler-pruning)
    - [ADR-015: Capped Job Retention, Redis Memory Bounds & Production Metrics Decoupling](#adr-015-capped-job-retention-redis-memory-bounds--production-metrics-decoupling)
+   - [ADR-016: Public Demo Threat Modeling, Blast Radius Containment & Self-Healing Watchdogs](#adr-016-public-demo-threat-modeling-blast-radius-containment--self-healing-watchdogs)
 4. [Failure Modes & Mitigation Matrix](#4-failure-modes--mitigation-matrix)
 5. [Load Testing & Invariant Verification](#5-load-testing--invariant-verification)
 6. [Scaling Roadmap (100x Scale)](#6-scaling-roadmap-100x-scale)
@@ -317,6 +318,33 @@ Qrew decouples synchronous API interactions from compute-intensive and rate-limi
   1. **External Time-Series / Prometheus Counters:** Export an atomic counter `qrew_jobs_completed_total{queue="my-queue", type="click-sync"}` incremented on the `completed` event via Prometheus client / OpenTelemetry.
   2. **Persistent Relational DB Metrics Table:** Asynchronously increment daily summary counters in PostgreSQL (`UPDATE queue_daily_stats SET completed_count = completed_count + 1 WHERE date = CURRENT_DATE`).
   3. **Lightweight Redis Counter Key:** Maintain a decoupled Redis integer counter (`INCR qrew:stats:lifetime_completed`) that stores an 8-byte integer without retaining heavyweight job hashes or payloads.
+
+---
+
+### ADR-016: Public Demo Threat Modeling, Blast Radius Containment & Self-Healing Watchdogs
+* **Status:** Accepted | **Date:** 2026-11-10
+* **Context:**
+  For public portfolio demonstration and engineering assessment, Qrew exposes live Bull Board dashboards and REST dispatch endpoints. To authentically showcase Dead Letter Queue (DLQ) replay, Redlock-protected retry serialization, and role-based access control (RBAC), the Admin role (`admin / demo_admin_pass`) is intentionally granted mutating permissions rather than read-only restrictions. Public administrative access introduces specific attack vectors and denial-of-service risks:
+  1. *Queue Freezing / Griefing:* A visitor clicking "Pause Queue" in Bull Board writes `paused` state directly into Redis (`bull:my-queue:meta`). Because pause state persists in Redis across container restarts, one visitor can stall processing indefinitely for all subsequent portfolio reviewers.
+  2. *Buffer Overrun & Memory Exhaustion:* Unauthenticated callers could flood `POST /api/v1/jobs` with oversized payloads or high-frequency bursts, exhausting the 30MB RAM ceiling of free-tier Redis Cloud.
+  3. *Malicious Payload / Remote Code Execution (RCE):* If job processors parse untrusted input into shell executions, arbitrary HTTP fetches, or outbound email relays, attackers could leverage Bull Board's job creation/editing capabilities for SSRF, spam relay, or remote execution.
+* **Decision & Mitigations:**
+  1. **Self-Healing Watchdog & Boot Auto-Resume:**
+     - Enforced `queue.resume()` on startup in `src/server.ts` to ensure cold restarts never inherit a paused Redis state.
+     - Registered an unref'd 60-second watchdog timer (`setInterval`) that queries `queue.isPaused()`. If paused, it automatically triggers `queue.resume()`, bounding the maximum denial-of-service window caused by a visitor pausing the queue to $\le 60$ seconds without requiring manual intervention or redeployments.
+  2. **Strict Ingress Rate Limiting & Body Cap:**
+     - Added `express-rate-limit` middleware on `POST /api/v1/jobs` and DLQ replay endpoints, strictly capping submissions to 60 requests per minute per IP.
+     - Enforced `express.json({ limit: '10kb' })` to reject any oversized payload before it reaches memory or Redis.
+  3. **Strict Payload Allowlist & Zero-Egress Simulation:**
+     - Replaced open job handling with a strict compile-time allowlist (`ALLOWED_JOB_TYPES = ['notification', 'email', 'image-processing', 'click-sync']`). Any unapproved job type is rejected synchronously with `400 Bad Request`.
+     - Worker handlers execute strictly simulated async workloads (artificial delays, mock telemetry, parameterized SQL). Handlers perform no arbitrary network egress, invoke no shell/subprocess commands, and connect to no real SMTP servers.
+  4. **Isolated Infrastructure & Ephemeral Blast Radius:**
+     - Dedicated demo instances for Redis (Redis Cloud free tier) and PostgreSQL (Neon serverless demo branch).
+     - Credentials match no internal or production systems.
+     - Destructive mutations are strictly bounded to Redis queue keys (`can clear/retry jobs, cannot delete code or cloud infra`).
+* **Consequences & Trade-offs:**
+  - *Trade-off:* An aggressive reviewer pausing the queue will see the queue pause briefly, but it will automatically unpause within 60 seconds.
+  - *Benefit:* Reviewers experience real interactive administrative actions (pausing, retrying, replaying DLQ) while the system guarantees self-healing and complete infrastructure immunity.
 
 ---
 

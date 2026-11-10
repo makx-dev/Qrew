@@ -18,6 +18,8 @@ A production-oriented distributed asynchronous job queue engine built with **Typ
 - **Viewer**: `viewer` / `demo_viewer_pass`
 - **Admin**: `admin` / `demo_admin_pass`
 
+> 🛡️ **Public Demo Security & Blast Radius**: Public demo credentials run against isolated sandbox instances. Mutations are strictly bounded to demo queue states (admins can clear, retry, or pause demo jobs, but cannot touch host code or cloud infrastructure). Ingress is rate-limited (60 req/min, 10kb body limit), worker jobs are safe simulations with payload type allowlists, and an automated background watchdog auto-resumes the queue if paused. See [ADR-016](./ADR.md#adr-016-public-demo-threat-modeling-blast-radius-containment--self-healing-watchdogs).
+
 ---
 
 Qrew decouples synchronous API traffic from compute-intensive or rate-limited work such as transactional OTPs, bulk emails, image processing and database write-behind syncs. It ships with strict priority scheduling, tiered retries with jitter, poison-pill isolation, SHA-256 idempotency at the ingress layer, throttled progress telemetry, a native dead-letter queue with Redlock-protected replay, role-partitioned Bull Board dashboards, and a documented failure-mode matrix.

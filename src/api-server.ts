@@ -1,6 +1,7 @@
 import express, { Request, Response, NextFunction } from 'express';
 import { Queue, Job, QueueEvents } from 'bullmq';
 import { Server } from 'http';
+import rateLimit from 'express-rate-limit';
 import { redisConnection } from './redis-connection';
 import { IdempotencyManager } from './idempotency';
 import { isPoisonPill } from './errors';
@@ -16,7 +17,21 @@ import {
 } from './JobTypes';
 
 export const app = express();
-app.use(express.json());
+
+// Strict payload cap (10kb) to prevent RAM exhaustion on public demo ingress
+app.use(express.json({ limit: '10kb' }));
+
+// Ingress Rate Limiter: Max 60 requests per minute per IP to protect free-tier Redis
+export const ingressLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 60,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: {
+        error: 'Too Many Requests',
+        message: 'Rate limit exceeded. Public demo ingress is limited to 60 requests/min per IP.',
+    },
+});
 
 // Main default queue instance
 export const queue = new Queue('my-queue', { connection: redisConnection });
@@ -842,9 +857,21 @@ app.get('/health', async (_req: Request, res: Response) => {
 });
 
 /**
+ * Allowed job types in demo environment
+ */
+export const ALLOWED_JOB_TYPES = ['notification', 'email', 'image-processing', 'click-sync'];
+
+/**
  * Helper to validate job input payloads according to their type
  */
 function validateJobPayload(type: string, data: any): { valid: boolean; error?: string } {
+    if (!ALLOWED_JOB_TYPES.includes(type)) {
+        return {
+            valid: false,
+            error: `Invalid job type "${type}". Allowed demo types are: ${ALLOWED_JOB_TYPES.join(', ')}.`,
+        };
+    }
+
     if (!data || typeof data !== 'object') {
         return { valid: false, error: 'Request body must contain a valid "data" object.' };
     }
@@ -879,8 +906,7 @@ function validateJobPayload(type: string, data: any): { valid: boolean; error?: 
             break;
         }
         default:
-            // Custom or generic tasks allowed
-            break;
+            return { valid: false, error: `Unsupported job type "${type}".` };
     }
 
     return { valid: true };
@@ -979,8 +1005,8 @@ async function handleSubmitJob(req: Request, res: Response) {
     }
 }
 
-app.post('/api/v1/jobs', handleSubmitJob);
-app.post('/api/v1/queues/:queueName/jobs', handleSubmitJob);
+app.post('/api/v1/jobs', ingressLimiter, handleSubmitJob);
+app.post('/api/v1/queues/:queueName/jobs', ingressLimiter, handleSubmitJob);
 
 // 2. CHECK STATUS / PROGRESS ENDPOINTS
 
@@ -1125,8 +1151,8 @@ async function handleRetryJob(req: Request, res: Response) {
     }
 }
 
-app.post('/api/v1/dlq/jobs/:id/retry', handleRetryJob);
-app.post('/api/v1/queues/:queueName/dlq/jobs/:id/retry', handleRetryJob);
+app.post('/api/v1/dlq/jobs/:id/retry', ingressLimiter, handleRetryJob);
+app.post('/api/v1/queues/:queueName/dlq/jobs/:id/retry', ingressLimiter, handleRetryJob);
 
 // 4B. Batch DLQ Replay via ReplayService (Redlock protected)
 async function handleBatchRetry(req: Request, res: Response) {
@@ -1150,8 +1176,8 @@ async function handleBatchRetry(req: Request, res: Response) {
     }
 }
 
-app.post('/api/v1/dlq/retry-batch', handleBatchRetry);
-app.post('/api/v1/queues/:queueName/dlq/retry-batch', handleBatchRetry);
+app.post('/api/v1/dlq/retry-batch', ingressLimiter, handleBatchRetry);
+app.post('/api/v1/queues/:queueName/dlq/retry-batch', ingressLimiter, handleBatchRetry);
 
 // 5. QUEUE METRICS & DEPTH TELEMETRY
 async function handleGetQueueMetrics(_req: Request, res: Response) {
