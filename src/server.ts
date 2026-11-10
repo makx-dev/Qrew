@@ -1,7 +1,6 @@
 // src/server.ts
-import { startServer } from './api-server';
+import { startServer, queue, queueEvents } from './api-server';
 import { worker, shutdownWorker } from './worker';
-import { queue } from './api-server';
 import { setupClickSyncScheduler } from './click-sync-scheduler';
 import { redisConnection } from './redis-connection';
 
@@ -24,6 +23,7 @@ const handleShutdown = async () => {
     console.log('[Qrew] Graceful shutdown initiated...');
     server.close();
     await shutdownWorker();
+    await queueEvents.close();
     await queue.close();
     await redisConnection.quit();
     process.exit(0);

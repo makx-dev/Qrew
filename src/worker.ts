@@ -51,22 +51,22 @@ export const worker = new Worker(
 
                 const data = job.data as ImageProcessingPayload;
 
-                // Instantiate per-job throttler: max 1 write/sec or >= 5% change
+                // Instantiate per-job throttler: min 800ms between Redis writes, >= 5% delta
                 const progressTracker = new ThrottledProgress(job, {
-                    minIntervalMs: 1000,
+                    minIntervalMs: 800,
                     minDelta: 5,
                 });
 
-                // Simulate multi-chunk processing (20 chunks x 150ms = ~3000ms duration)
-                const totalChunks = 20;
+                // Simulate multi-chunk processing (18 chunks x 250ms = 4.5s duration)
+                const totalChunks = 18;
                 for (let chunk = 1; chunk <= totalChunks; chunk++) {
-                    await new Promise((r) => setTimeout(r, 150));
+                    await new Promise((r) => setTimeout(r, 250));
                     const percent = Math.floor((chunk / totalChunks) * 100);
-                    // High-frequency call: throttler drops redundant Redis writes in memory
+                    // Throttler handles intermediate gates
                     await progressTracker.update(percent);
                 }
 
-                // Guaranteed terminal flush to ensure Redis state is strictly 100%
+                // Guaranteed terminal flush to bypass throttle and force strictly 100%
                 await progressTracker.flush(100);
 
                 console.log(`[DONE] Resized image ${data.imageUrl} to ${data.dimensions.width}x${data.dimensions.height}`);

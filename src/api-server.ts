@@ -1,5 +1,5 @@
 import express, { Request, Response, NextFunction } from 'express';
-import { Queue, Job } from 'bullmq';
+import { Queue, Job, QueueEvents } from 'bullmq';
 import { Server } from 'http';
 import { redisConnection } from './redis-connection';
 import { IdempotencyManager } from './idempotency';
@@ -21,6 +21,89 @@ app.use(express.json());
 // Main default queue instance
 export const queue = new Queue('my-queue', { connection: redisConnection });
 const idempotency = new IdempotencyManager(redisConnection);
+
+// Single shared QueueEvents instance (1 connection for the entire server to respect connection limits)
+export const queueEvents = new QueueEvents('my-queue', {
+    connection: redisConnection.duplicate(),
+});
+
+// Real-time SSE fan-out registry capped at 50 to protect free-tier instances
+const MAX_SSE_CLIENTS = 50;
+const sseClients = new Set<Response>();
+
+export function broadcastSSE(event: string, data: any) {
+    const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+    for (const client of sseClients) {
+        try {
+            client.write(payload);
+        } catch {
+            sseClients.delete(client);
+        }
+    }
+}
+
+// 15s keep-alive heartbeat ping so proxies (Render, Cloudflare, Nginx) do not drop idle connections
+const pingInterval = setInterval(() => {
+    for (const client of sseClients) {
+        try {
+            client.write(': ping\n\n');
+        } catch {
+            sseClients.delete(client);
+        }
+    }
+}, 15000);
+pingInterval.unref();
+
+// Debounced metrics broadcaster across all connected SSE clients
+let metricsBroadcastTimer: NodeJS.Timeout | null = null;
+export async function broadcastMetricsSnapshot() {
+    if (metricsBroadcastTimer) return;
+    metricsBroadcastTimer = setTimeout(async () => {
+        metricsBroadcastTimer = null;
+        try {
+            const counts = await queue.getJobCounts('waiting', 'active', 'completed', 'failed', 'delayed', 'prioritized');
+            const totalWaiting = (counts.waiting || 0) + (counts.prioritized || 0);
+            broadcastSSE('metrics', {
+                active: counts.active || 0,
+                waiting: totalWaiting,
+                delayed: counts.delayed || 0,
+                failed: counts.failed || 0,
+                completed: counts.completed || 0,
+                paused: counts.paused || 0,
+            });
+        } catch {}
+    }, 100);
+}
+
+// Attach shared QueueEvents listeners
+queueEvents.on('waiting', ({ jobId }) => {
+    broadcastSSE('waiting', { jobId });
+    broadcastMetricsSnapshot();
+});
+
+queueEvents.on('active', ({ jobId, prev }) => {
+    broadcastSSE('active', { jobId, prev });
+    broadcastMetricsSnapshot();
+});
+
+queueEvents.on('progress', ({ jobId, data }) => {
+    broadcastSSE('progress', { jobId, progress: Number(data) });
+});
+
+queueEvents.on('completed', ({ jobId, returnvalue }) => {
+    broadcastSSE('completed', { jobId, returnvalue });
+    broadcastMetricsSnapshot();
+});
+
+queueEvents.on('failed', ({ jobId, failedReason }) => {
+    broadcastSSE('failed', { jobId, failedReason });
+    broadcastMetricsSnapshot();
+});
+
+queueEvents.on('delayed', ({ jobId, delay }) => {
+    broadcastSSE('delayed', { jobId, delay });
+    broadcastMetricsSnapshot();
+});
 
 // Setup multi-role Bull Board instances (Admin vs User Read-Only)
 export const { adminRouter, userRouter } = createMultiRoleBullBoards({
@@ -461,6 +544,25 @@ app.get('/', (_req: Request, res: Response) => {
       </div>
     </div>
 
+    <!-- Real-Time Job Progress Tracker (Appears when active or in-flight) -->
+    <div id="progress-container" class="card" style="display: none; border-color: rgba(56, 189, 248, 0.4); background: #0c1527; margin-bottom: 28px;">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+        <div style="display: flex; align-items: center; gap: 8px;">
+          <i data-lucide="loader-2" class="spin" style="width: 16px; height: 16px; color: var(--accent);"></i>
+          <span style="font-size: 14px; font-weight: 600; color: #fff;" id="progress-title">In-Flight Workload</span>
+          <span class="tier-badge tier-p3" id="progress-badge">P3</span>
+        </div>
+        <span style="font-size: 13px; font-weight: 700; color: var(--accent); font-family: 'JetBrains Mono', monospace;" id="progress-percent">0%</span>
+      </div>
+      <div style="background: #1e293b; border-radius: 6px; height: 8px; overflow: hidden; width: 100%;">
+        <div id="progress-bar-fill" style="background: linear-gradient(90deg, #0284c7, #38bdf8); height: 100%; width: 0%; transition: width 0.4s cubic-bezier(0.4, 0, 0.2, 1); border-radius: 6px;"></div>
+      </div>
+      <div style="display: flex; justify-content: space-between; margin-top: 8px; font-size: 11px; color: var(--text-dim); font-family: 'JetBrains Mono', monospace;">
+        <span id="progress-sub">Job #... &bull; Processing chunks</span>
+        <span id="progress-state" style="color: var(--accent); text-transform: uppercase;">active</span>
+      </div>
+    </div>
+
     <!-- Terminal -->
     <div class="card">
       <div class="terminal-header">
@@ -471,14 +573,14 @@ app.get('/', (_req: Request, res: Response) => {
             <div class="t-dot green"></div>
           </div>
           <span style="font-size: 13px; font-weight: 600; color: var(--text-muted); display: flex; align-items: center; gap: 6px;">
-            <i data-lucide="terminal" style="width: 14px; height: 14px;"></i> Live Dispatch Console
+            <i data-lucide="terminal" style="width: 14px; height: 14px;"></i> Live Real-Time Dispatch Console
           </span>
         </div>
         <button class="clear-btn" onclick="clearLogs()">
           <i data-lucide="trash-2" style="width: 12px; height: 12px;"></i> Clear
         </button>
       </div>
-      <pre id="console-log"><span class="log-ts">[Ready]</span> Dispatcher initialized. Trigger any job above to observe live ingestion.</pre>
+      <pre id="console-log"><span class="log-ts">[Ready]</span> Real-time SSE stream connected. Trigger any workload to observe sub-millisecond telemetry.</pre>
     </div>
   </div>
 
@@ -498,34 +600,185 @@ app.get('/', (_req: Request, res: Response) => {
     }
 
     function clearLogs() {
-      logEl.innerHTML = '<span class="log-ts">[Cleared]</span> Console buffer reset.';
+      logEl.innerHTML = '<span class="log-ts">[Cleared]</span> Console buffer reset.\\n';
     }
 
-    async function fetchMetrics() {
-      try {
-        const res = await fetch('/api/v1/metrics');
-        if (!res.ok) throw new Error('Status ' + res.status);
-        const data = await res.json();
-        const statusEl = document.getElementById('broker-status');
-        statusEl.innerHTML = '<span class="status-dot"></span>Broker Connected';
+    // Active State Visual Hold (Holds Active on UI for >= 750ms so 200ms jobs are visible)
+    const visualActiveJobs = new Map();
+    let serverActiveCount = 0;
+
+    function updateActiveDisplay() {
+      const displayed = Math.max(serverActiveCount, visualActiveJobs.size);
+      document.getElementById('stat-active').textContent = displayed;
+    }
+
+    function holdActive(jobId) {
+      visualActiveJobs.set(String(jobId), Date.now());
+      updateActiveDisplay();
+    }
+
+    function releaseActive(jobId) {
+      const idStr = String(jobId);
+      const start = visualActiveJobs.get(idStr);
+      const minHoldMs = 750;
+      const elapsed = start ? (Date.now() - start) : minHoldMs;
+      const remaining = Math.max(0, minHoldMs - elapsed);
+      setTimeout(() => {
+        visualActiveJobs.delete(idStr);
+        updateActiveDisplay();
+      }, remaining);
+    }
+
+    function applyMetrics(m) {
+      if (!m) return;
+      serverActiveCount = m.active || 0;
+      updateActiveDisplay();
+      document.getElementById('stat-waiting').textContent = m.waiting || 0;
+      document.getElementById('stat-completed').textContent = m.completed || 0;
+      document.getElementById('stat-failed').textContent = m.failed || 0;
+      document.getElementById('stat-delayed').textContent = m.delayed || 0;
+    }
+
+    function setBrokerStatus(online) {
+      const statusEl = document.getElementById('broker-status');
+      if (online) {
+        statusEl.innerHTML = '<span class="status-dot"></span>Broker Connected (SSE Active)';
         statusEl.style.color = '#10b981';
         statusEl.style.borderColor = 'rgba(16, 185, 129, 0.25)';
-
-        document.getElementById('stat-active').textContent = data.metrics.active;
-        document.getElementById('stat-waiting').textContent = data.metrics.waiting;
-        document.getElementById('stat-completed').textContent = data.metrics.completed;
-        document.getElementById('stat-failed').textContent = data.metrics.failed;
-        document.getElementById('stat-delayed').textContent = data.metrics.delayed;
-      } catch (err) {
-        const statusEl = document.getElementById('broker-status');
-        statusEl.innerHTML = '<span class="status-dot" style="background: #ef4444; box-shadow: 0 0 8px #ef4444;"></span>Broker Offline';
+      } else {
+        statusEl.innerHTML = '<span class="status-dot" style="background: #ef4444; box-shadow: 0 0 8px #ef4444;"></span>Broker Reconnecting';
         statusEl.style.color = '#ef4444';
         statusEl.style.borderColor = 'rgba(239, 68, 68, 0.25)';
       }
     }
 
+    // Progress Bar UI Management
+    let activeProgressTimer = null;
+    function updateProgressUI(jobId, pct) {
+      const container = document.getElementById('progress-container');
+      const bar = document.getElementById('progress-bar-fill');
+      const txt = document.getElementById('progress-percent');
+      const sub = document.getElementById('progress-sub');
+      const state = document.getElementById('progress-state');
+      if (activeProgressTimer) { clearTimeout(activeProgressTimer); activeProgressTimer = null; }
+
+      container.style.display = 'block';
+      bar.style.width = pct + '%';
+      txt.textContent = pct + '%';
+      sub.textContent = 'Job #' + jobId + ' \u2022 Processing multi-chunk workload';
+      state.textContent = 'active';
+      state.style.color = 'var(--accent)';
+    }
+
+    function completeProgressUI(jobId) {
+      const bar = document.getElementById('progress-bar-fill');
+      const txt = document.getElementById('progress-percent');
+      const state = document.getElementById('progress-state');
+      if (bar) bar.style.width = '100%';
+      if (txt) txt.textContent = '100%';
+      if (state) {
+        state.textContent = 'completed';
+        state.style.color = 'var(--success)';
+      }
+      activeProgressTimer = setTimeout(() => {
+        const container = document.getElementById('progress-container');
+        if (container) container.style.display = 'none';
+      }, 3000);
+    }
+
+    function failProgressUI(jobId, reason) {
+      const bar = document.getElementById('progress-bar-fill');
+      const state = document.getElementById('progress-state');
+      if (bar) bar.style.background = 'var(--danger)';
+      if (state) {
+        state.textContent = 'failed';
+        state.style.color = 'var(--danger)';
+      }
+      activeProgressTimer = setTimeout(() => {
+        const container = document.getElementById('progress-container');
+        if (container) container.style.display = 'none';
+      }, 3500);
+    }
+
+    // Connect Real-Time SSE Stream
+    let evtSource = null;
+    function initSSE() {
+      if (evtSource) {
+        evtSource.close();
+      }
+      evtSource = new EventSource('/api/v1/stream');
+
+      evtSource.addEventListener('snapshot', (e) => {
+        try {
+          const data = JSON.parse(e.data);
+          applyMetrics(data.metrics);
+          setBrokerStatus(true);
+        } catch {}
+      });
+
+      evtSource.addEventListener('metrics', (e) => {
+        try {
+          const data = JSON.parse(e.data);
+          applyMetrics(data);
+        } catch {}
+      });
+
+      evtSource.addEventListener('waiting', (e) => {
+        try {
+          const data = JSON.parse(e.data);
+          log('Queued &bull; Job #' + data.jobId + ' enqueued onto broker ZSET', 'info');
+        } catch {}
+      });
+
+      evtSource.addEventListener('active', (e) => {
+        try {
+          const data = JSON.parse(e.data);
+          holdActive(data.jobId);
+          log('Worker Started &bull; Processing Job #' + data.jobId, 'info');
+        } catch {}
+      });
+
+      evtSource.addEventListener('progress', (e) => {
+        try {
+          const data = JSON.parse(e.data);
+          updateProgressUI(data.jobId, data.progress);
+          log('Telemetry &bull; Job #' + data.jobId + ' progress: ' + data.progress + '%', 'info');
+        } catch {}
+      });
+
+      evtSource.addEventListener('completed', (e) => {
+        try {
+          const data = JSON.parse(e.data);
+          releaseActive(data.jobId);
+          completeProgressUI(data.jobId);
+          log('Completed &bull; Job #' + data.jobId + ' processed successfully', 'success');
+        } catch {}
+      });
+
+      evtSource.addEventListener('failed', (e) => {
+        try {
+          const data = JSON.parse(e.data);
+          releaseActive(data.jobId);
+          failProgressUI(data.jobId, data.failedReason);
+          log('DLQ Quarantined &bull; Job #' + data.jobId + ' failed: ' + (data.failedReason || 'Fatal Error'), 'err');
+        } catch {}
+      });
+
+      evtSource.onopen = () => {
+        setBrokerStatus(true);
+      };
+
+      evtSource.onerror = () => {
+        setBrokerStatus(false);
+      };
+    }
+
+    // Dispatcher API Trigger
     async function dispatch(type, payload, priority) {
       log("Enqueueing " + type + " (Priority " + priority + ")...", 'info');
+      if (type === 'image-processing') {
+        updateProgressUI('...', 0);
+      }
       try {
         const res = await fetch('/api/v1/jobs', {
           method: 'POST',
@@ -534,18 +787,32 @@ app.get('/', (_req: Request, res: Response) => {
         });
         const json = await res.json();
         if (res.status === 202) {
-          log("Accepted (202) &bull; Job ID: #" + json.jobId + " &bull; State: " + json.status, 'success');
+          log("Accepted (202) &bull; Job ID: #" + json.jobId + " &bull; Status: " + json.status, 'success');
         } else {
           log("Rejected (" + res.status + "): " + (json.message || JSON.stringify(json)), 'warn');
         }
-        setTimeout(fetchMetrics, 700);
       } catch (err) {
         log("Network Error: " + err.message, 'err');
       }
     }
 
-    fetchMetrics();
-    setInterval(fetchMetrics, 3000);
+    // Periodic Reconciliation (Poll every 1.5s as fallback/reconciliation)
+    async function reconcileMetrics() {
+      try {
+        const res = await fetch('/api/v1/metrics');
+        if (!res.ok) throw new Error('Status ' + res.status);
+        const data = await res.json();
+        applyMetrics(data.metrics);
+        if (!evtSource || evtSource.readyState === EventSource.CLOSED) {
+          initSSE();
+        }
+      } catch {
+        setBrokerStatus(false);
+      }
+    }
+
+    initSSE();
+    setInterval(reconcileMetrics, 1500);
   </script>
 </body>
 </html>`);
@@ -929,6 +1196,49 @@ async function handleGetQueueMetrics(_req: Request, res: Response) {
 
 app.get('/api/v1/metrics', handleGetQueueMetrics);
 app.get('/api/v1/queues/:queueName/metrics', handleGetQueueMetrics);
+
+/**
+ * 6. REAL-TIME SERVER-SENT EVENTS (SSE) TELEMETRY STREAM
+ * Pushes sub-millisecond job state transitions and metrics snapshots to connected browsers.
+ */
+app.get('/api/v1/stream', async (req: Request, res: Response) => {
+    if (sseClients.size >= MAX_SSE_CLIENTS) {
+        return res.status(429).json({
+            error: 'Too Many Requests',
+            message: 'Maximum concurrent real-time monitor stream connections reached (50).',
+        });
+    }
+
+    res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache, no-transform',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no',
+    });
+    res.flushHeaders?.();
+
+    sseClients.add(res);
+
+    // Immediate full metrics snapshot on connect
+    try {
+        const counts = await queue.getJobCounts('waiting', 'active', 'completed', 'failed', 'delayed', 'prioritized');
+        const totalWaiting = (counts.waiting || 0) + (counts.prioritized || 0);
+        res.write(`event: snapshot\ndata: ${JSON.stringify({
+            metrics: {
+                active: counts.active || 0,
+                waiting: totalWaiting,
+                delayed: counts.delayed || 0,
+                failed: counts.failed || 0,
+                completed: counts.completed || 0,
+                paused: counts.paused || 0,
+            },
+        })}\n\n`);
+    } catch {}
+
+    req.on('close', () => {
+        sseClients.delete(res);
+    });
+});
 
 // Global unhandled error handler
 app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
