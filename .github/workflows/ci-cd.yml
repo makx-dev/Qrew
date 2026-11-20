@@ -56,3 +56,4 @@ jobs:
             curl -f -X POST "${{ secrets.RENDER_DEPLOY_HOOK }}"
             echo "Deployment triggered successfully!"
           fi
+
