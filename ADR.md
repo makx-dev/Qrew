@@ -15,7 +15,8 @@
    - [ADR-002: Strict Priority Scheduling via Sorted Sets (`ZSET`)](#adr-002-strict-priority-scheduling-via-sorted-sets-zset)
    - [ADR-003: Tiered Retry Backoff with Jitter Tailored by Job SLA](#adr-003-tiered-retry-backoff-with-jitter-tailored-by-job-sla)
    - [ADR-004: Terminal vs. Transient Error Handling (`UnrecoverableError`)](#adr-004-terminal-vs-transient-error-handling-unrecoverableerror)
-   - [ADR-005: Redis Connection & `maxRetriesPerRequest: null`](#adr-005-redis-connection--maxretriesperrequest-null)
+   - [ADR-005: Redis Connection & `maxRetriesPerRequest: null`](#adr-005-redis-connection--maxretries
+   perrequest-null)
    - [ADR-006: Deterministic Two-Phase Graceful Shutdown](#adr-006-deterministic-two-phase-graceful-shutdown)
    - [ADR-007: Job Retention & Memory Pruning](#adr-007-job-retention--memory-pruning)
    - [ADR-008: In-Worker Lifecycle Telemetry](#adr-008-in-worker-lifecycle-telemetry)

@@ -1,0 +1,58 @@
+name: Qrew CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  # ==========================================
+  # CI: Quality & Build Gatekeeper
+  # ==========================================
+  build-and-test:
+    name: Build, Lint & Typecheck
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: TypeScript Typecheck & Compilation
+        run: npm run build
+
+      - name: Security Vulnerability Audit
+        run: npm audit --audit-level=high
+        continue-on-error: true
+
+      - name: Verify Docker Container Build
+        run: docker build -t qrew:test .
+
+  # ==========================================
+  # CD: Deploy to Render (Only on main branch)
+  # ==========================================
+  deploy:
+    name: Trigger Render Deployment
+    needs: build-and-test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Trigger Render Deploy Hook
+        run: |
+          if [ -z "${{ secrets.RENDER_DEPLOY_HOOK }}" ]; then
+            echo "::warning ::RENDER_DEPLOY_HOOK secret is not set. Skipping automated deploy."
+          else
+            echo "Triggering Render deployment..."
+            curl -f -X POST "${{ secrets.RENDER_DEPLOY_HOOK }}"
+            echo "Deployment triggered successfully!"
+          fi

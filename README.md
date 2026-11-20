@@ -5,6 +5,7 @@ A production-oriented distributed asynchronous job queue engine built with **Typ
 [![Live Demo](https://img.shields.io/badge/Live_Demo-Interactive_Console-2ea44f?style=for-the-badge&logo=render)](https://qrew.onrender.com)
 [![Bull Board](https://img.shields.io/badge/Bull_Board-Live_Dashboard-blue?style=for-the-badge&logo=redis)](https://qrew.onrender.com/user/queues)
 [![Docker](https://img.shields.io/badge/Docker-Compose_Ready-2496ED?style=for-the-badge&logo=docker)](./docker-compose.yml)
+[![CI/CD Pipeline](https://github.com/makx-dev/Qrew/actions/workflows/ci-cd.yml/badge.svg)](https://github.com/makx-dev/Qrew/actions/workflows/ci-cd.yml)
 
 > ⏳ *Note: First load may take 30–60s while the Render free-tier instance wakes up.*
 
